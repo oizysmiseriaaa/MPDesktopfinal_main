@@ -1,0 +1,286 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 220 33% 98%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+    --primary: 39 94% 52%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 17% 96%;
+    --secondary-foreground: 222 47% 11%;
+    --muted: 220 17% 96%;
+    --muted-foreground: 220 9% 46%;
+    --accent: 39 94% 52%;
+    --accent-foreground: 0 0% 100%;
+    --accent-hover: 39 94% 45%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 220 16% 90%;
+    --input: 220 16% 96%;
+    --ring: 39 94% 52%;
+    --radius: 1.25rem;
+    --shadow-card: 0 20px 60px -40px rgba(15, 23, 42, 0.45);
+    --shadow-card-hover: 0 28px 80px -42px rgba(15, 23, 42, 0.55);
+
+    /* Calendar design tokens (light) */
+    --bg-primary: 220 33% 98%;
+    --bg-surface: 0 0% 100%;
+    --bg-secondary: 220 25% 95%;
+    --text-primary: 222 47% 11%;
+    --text-secondary: 220 9% 46%;
+    --status-paid: #16a34a;
+    --status-paid-bg: rgba(22, 163, 74, 0.12);
+    --status-unpaid: #dc2626;
+    --status-unpaid-bg: rgba(220, 38, 38, 0.10);
+    --status-reserved: #d97706;
+    --status-reserved-bg: rgba(217, 119, 6, 0.14);
+    --status-vacant: #94a3b8;
+
+    /* Common UI tokens (used by frontend-only components) */
+    --gridline: hsl(var(--border));
+    --focus-ring: hsl(var(--ring));
+  }
+
+  .dark {
+    --background: 224 29% 8%;
+    --foreground: 210 22% 95%;
+    --card: 224 25% 11%;
+    --card-foreground: 210 22% 95%;
+    --popover: 224 25% 12%;
+    --popover-foreground: 210 22% 95%;
+    --primary: 39 100% 56%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 222 23% 16%;
+    --secondary-foreground: 210 22% 95%;
+    --muted: 222 21% 18%;
+    --muted-foreground: 215 13% 74%;
+    --accent: 39 100% 56%;
+    --accent-foreground: 222 47% 11%;
+    --accent-hover: 39 100% 62%;
+    --destructive: 0 82% 60%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 220 18% 26%;
+    --input: 222 23% 16%;
+    --ring: 39 100% 56%;
+    --shadow-card: 0 28px 90px -42px rgba(2, 6, 23, 0.92);
+    --shadow-card-hover: 0 34px 120px -48px rgba(2, 6, 23, 0.98);
+
+    /* Calendar design tokens (dark) */
+    --bg-primary: 224 29% 8%;
+    --bg-surface: 224 25% 11%;
+    --bg-secondary: 224 25% 13%;
+    --text-primary: 210 22% 95%;
+    --text-secondary: 215 13% 74%;
+    --status-paid: #4ade80;
+    --status-paid-bg: rgba(74, 222, 128, 0.16);
+    --status-unpaid: #f87171;
+    --status-unpaid-bg: rgba(248, 113, 113, 0.16);
+    --status-reserved: #fbbf24;
+    --status-reserved-bg: rgba(251, 191, 36, 0.18);
+    --status-vacant: #94a3b8;
+  }
+}
+
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    scroll-behavior: smooth;
+    color-scheme: light;
+  }
+
+  html.dark {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: 'Outfit', sans-serif;
+    background:
+      radial-gradient(circle at top left, rgba(245, 158, 11, 0.16), transparent 22%),
+      linear-gradient(180deg, #f8fafc 0%, #f4f7fb 100%);
+  }
+
+  .dark body {
+    background:
+      radial-gradient(circle at top left, rgba(245, 158, 11, 0.24), transparent 22%),
+      radial-gradient(circle at top right, rgba(59, 130, 246, 0.18), transparent 26%),
+      linear-gradient(180deg, #020617 0%, #08101d 52%, #0b1220 100%);
+  }
+
+  ::selection {
+    background: rgba(245, 158, 11, 0.35);
+    color: inherit;
+  }
+
+  .dark .bg-white,
+  .dark .bg-gray-50,
+  .dark .bg-gray-100,
+  .dark .bg-slate-50,
+  .dark .bg-slate-100,
+  .dark .bg-gray-50\/50,
+  .dark .bg-slate-50\/50 {
+    background-color: hsl(var(--secondary)) !important;
+  }
+
+  .dark .bg-slate-100,
+  .dark .bg-slate-200,
+  .dark .bg-gray-200 {
+    background-color: hsl(var(--muted)) !important;
+  }
+
+  .dark .border-slate-200,
+  .dark .border-slate-100,
+  .dark .border-gray-200,
+  .dark .border-gray-100,
+  .dark .ring-slate-200,
+  .dark .ring-slate-100,
+  .dark .ring-gray-200,
+  .dark .ring-gray-100 {
+    border-color: hsl(var(--border)) !important;
+    box-shadow: none !important;
+  }
+
+  .dark .text-slate-900,
+  .dark .text-slate-950,
+  .dark .text-slate-800,
+  .dark .text-gray-900,
+  .dark .text-gray-800 {
+    color: hsl(var(--foreground)) !important;
+  }
+
+  .dark .text-slate-700,
+  .dark .text-slate-600,
+  .dark .text-gray-700,
+  .dark .text-gray-600 {
+    color: hsl(var(--muted-foreground)) !important;
+  }
+
+  .dark .text-slate-500,
+  .dark .text-slate-400,
+  .dark .text-gray-500,
+  .dark .text-gray-400 {
+    color: hsl(var(--muted-foreground)) !important;
+  }
+
+  .dark .text-gray-300,
+  .dark .text-slate-300 {
+    color: hsl(var(--muted-foreground)) !important;
+  }
+
+  .dark .bg-amber-50,
+  .dark .bg-amber-100 {
+    background-color: rgba(245, 158, 11, 0.14) !important;
+  }
+
+  .dark .bg-card {
+    background-image:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.025), transparent),
+      linear-gradient(180deg, hsl(var(--card)) 0%, hsl(var(--card)) 100%);
+  }
+
+  .dark .surface,
+  .dark .surface-muted,
+  .dark .surface-inset {
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.035),
+      0 24px 80px -42px rgba(2, 6, 23, 0.92),
+      0 0 0 1px rgba(245, 158, 11, 0.05);
+  }
+
+  .dark .hover-elevate:hover {
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.04),
+      0 32px 110px -48px rgba(245, 158, 11, 0.38),
+      0 0 0 1px rgba(245, 158, 11, 0.10);
+  }
+
+  /* Premium focus ring used across interactive elements */
+  :where(button, a, input, textarea, select, [role="button"], [tabindex]):focus-visible {
+    @apply outline-none ring-2 ring-amber-500/60 ring-offset-2 ring-offset-background;
+  }
+}
+
+.gradient-header {
+  background: linear-gradient(135deg, #f59e0b 0%, #fbbf24 50%, #fcd34d 100%);
+}
+
+@layer components {
+  .surface {
+    @apply rounded-[24px] border border-border bg-card text-card-foreground shadow-card;
+    backdrop-filter: blur(12px);
+  }
+
+  .surface-muted {
+    @apply rounded-[24px] border border-border bg-secondary text-secondary-foreground;
+    backdrop-filter: blur(10px);
+  }
+
+  .surface-inset {
+    @apply rounded-[20px] border border-border bg-background/90;
+    backdrop-filter: blur(8px);
+  }
+
+  .panel-surface {
+    @apply rounded-[24px] border border-border bg-card text-card-foreground shadow-card;
+  }
+
+  .form-field {
+    @apply h-11 w-full rounded-2xl border border-border bg-background px-4 text-sm text-foreground ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .form-field-area {
+    @apply min-h-[100px] w-full rounded-2xl border border-border bg-background px-4 py-3 text-sm text-foreground ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  /* Eyebrow / kicker label used above page and section titles */
+  .eyebrow {
+    @apply text-[11px] font-bold uppercase tracking-[0.32em] text-amber-600;
+  }
+
+  /* Interactive row used in lists and tables for hover elevation */
+  .hover-elevate {
+    @apply transition-all duration-200 ease-premium hover:-translate-y-0.5 hover:shadow-card-hover;
+  }
+}
+
+.gradient-btn {
+  background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+}
+
+.gradient-btn:hover {
+  background: linear-gradient(135deg, #d97706 0%, #b45309 100%);
+}
+
+.card-shadow {
+  box-shadow: 0 10px 30px -24px rgba(15, 23, 42, 0.35);
+}
+
+.status-available { background-color: #10b981; }
+.status-booked { background-color: #ef4444; }
+.status-blocked { background-color: #6b7280; }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: #eef2f7; border-radius: 999px; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 999px; }
+::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

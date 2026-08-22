@@ -1,0 +1,14 @@
+{
+  "css.validate": false,
+  "css.customData": [
+    "./.vscode/tailwind-css-custom-data.json"
+  ],
+  "css.lint.unknownAtRules": "ignore",
+  "files.associations": {
+    "*.css": "postcss"
+  },
+  "tailwindCSS.includeLanguages": {
+    "typescript": "html",
+    "typescriptreact": "html"
+  }
+}

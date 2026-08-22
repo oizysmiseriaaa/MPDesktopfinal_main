@@ -1,0 +1,34 @@
+{
+  "placeholderImages": [
+    {
+      "id": "listing-1",
+      "description": "Modern Minimalist Loft",
+      "imageUrl": "https://images.unsplash.com/photo-1592928302636-c83cf1e1c887?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3NDE5ODJ8MHwxfHNlYXJjaHw4fHxtb2Rlcm4lMjBsb2Z0fGVufDB8fHx8MTc3MTkyMzk3OXww&ixlib=rb-4.1.0&q=80&w=1080",
+      "imageHint": "modern loft"
+    },
+    {
+      "id": "listing-2",
+      "description": "Oceanfront Villa",
+      "imageUrl": "https://images.unsplash.com/photo-1764339441207-c55b7ae4a15e?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3NDE5ODJ8MHwxfHNlYXJjaHw2fHxvY2VhbmZyb250JTIwdmlsbGF8ZW58MHx8fHwxNzcyMDI1NTEyfDA&ixlib=rb-4.1.0&q=80&w=1080",
+      "imageHint": "oceanfront villa"
+    },
+    {
+      "id": "listing-3",
+      "description": "Cozy Mountain Cabin",
+      "imageUrl": "https://images.unsplash.com/photo-1610301349088-1d7ec5a1d961?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3NDE5ODJ8MHwxfHNlYXJjaHwxMHx8bW91bnRhaW4lMjBjYWJpbnxlbnwwfHx8fDE3NzIwMjU1MTJ8MA&ixlib=rb-4.1.0&q=80&w=1080",
+      "imageHint": "mountain cabin"
+    },
+    {
+      "id": "avatar-1",
+      "description": "Host Avatar",
+      "imageUrl": "https://images.unsplash.com/photo-1500648767791-00dcc994a43e?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3NDE5ODJ8MHwxfHNlYXJjaHwxfHxwb3J0cmFpdHxlbnwwfHx8fDE3NzIwMjA3NDF8MA&ixlib=rb-4.1.0&q=80&w=1080",
+      "imageHint": "portrait"
+    },
+    {
+      "id": "avatar-2",
+      "description": "Guest Avatar",
+      "imageUrl": "https://images.unsplash.com/photo-1500648767791-00dcc994a43e?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3NDE5ODJ8MHwxfHNlYXJjaHwxfHxwb3J0cmFpdHxlbnwwfHx8fDE3NzIwMjA3NDF8MA&ixlib=rb-4.1.0&q=80&w=1080",
+      "imageHint": "portrait"
+    }
+  ]
+}

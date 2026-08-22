@@ -1,0 +1,245 @@
+/**
+ * Manila Prime Property Management - Firestore Security Rules
+ * 
+ * Core Philosophy: 
+ * This ruleset implements a strict hierarchical user-ownership model. Every data entity 
+ * (Units, Bookings, Payments, Expenses, etc.) is stored within a subcollection under a 
+ * specific user's document path (/users/{userId}/...). This ensures total data isolation 
+ * between different property managers/administrators.
+ * 
+ * Data Structure: 
+ * - /users/{userId}: The root container for a specific administrator's data.
+ * - Subcollections: /units, /bookings, /payments, /expenses, /investors, /investorAssignments, /agents, /reminders.
+ * - Singleton: /settings/config stores system-wide preferences for that user.
+ * 
+ * Key Security Decisions: 
+ * - Path-Based Authorization: Ownership is verified by comparing the 'userId' segment 
+ *   of the document path with the 'uid' of the authenticated request. This provides 
+ *   O(1) authorization checks without additional database reads.
+ * - Prototyping Flexibility: While authorization is strictly enforced (who can access what), 
+ *   the shape of the data is not strictly validated to allow for rapid UI/Schema iteration.
+ * - Structural Segregation: There are no public collections. All access requires 
+ *   authentication and ownership.
+ * 
+ * Denormalization for Authorization: 
+ * Authorization is primarily driven by the document path hierarchy. No complex cross-collection 
+ * lookups (get() calls) are required to verify ownership, maximizing performance and reliability.
+ */
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --- Global Helper Functions ---
+
+    /**
+     * @description Checks if the request is from an authenticated user.
+     */
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    /**
+     * @description Checks if the authenticated user's UID matches the userId in the path.
+     */
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    /**
+     * @description Combines ownership check with verification that the document exists.
+     * Used for update and delete operations.
+     */
+    function isExistingOwner(userId) {
+      return isOwner(userId) && resource != null;
+    }
+
+    /**
+     * @description Validates that the 'id' field in the document matches the path's document ID.
+     */
+    function idMatchesPath(docId) {
+      return request.resource.data.id == docId;
+    }
+
+    /**
+     * @description Ensures that critical identification fields remain immutable during updates.
+     */
+    function isIdImmutable() {
+      return request.resource.data.id == resource.data.id;
+    }
+
+    // The deployed application uses these shared top-level operational
+    // collections. Reads are available to signed-in users; direct writes are
+    // limited to staff/admin. Functions enforce the same requirement server-side.
+    function isOperationsStaff() {
+      return isSignedIn() && (
+        request.auth.token.admin == true ||
+        request.auth.token.role in ['admin', 'staff'] ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ['admin', 'staff'])
+      );
+    }
+
+    // A newly registered email/password account may create only its own
+    // viewer profile. Role assignment is immutable from the client so a user
+    // can never self-promote; staff/admin changes must go through a trusted
+    // server-side operation.
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow create: if isOwner(userId)
+        && request.resource.data.id == userId
+        && request.resource.data.role == 'viewer'
+        && request.resource.data.email == request.auth.token.email;
+      allow update: if isOwner(userId)
+        && request.resource.data.id == resource.data.id
+        && request.resource.data.role == resource.data.role;
+      allow delete: if false;
+    }
+
+    match /{collectionName}/{documentId} {
+      allow read: if isSignedIn() && collectionName in [
+        'units', 'bookings', 'expenses', 'booking-payments',
+        'security-deposits', 'agents', 'investors', 'reminders',
+        'housekeeping', 'notifications', 'incidents', 'profit-payments', 'config'
+      ];
+      allow create, update, delete: if isOperationsStaff() && collectionName in [
+        'units', 'bookings', 'expenses', 'booking-payments',
+        'security-deposits', 'agents', 'investors', 'reminders',
+        'housekeeping', 'notifications', 'incidents', 'profit-payments', 'config'
+      ];
+    }
+
+    // --- Collection Rules ---
+
+    /**
+     * @description Matches the system configuration document for the user.
+     * @path /users/{userId}/settings/{settingId}
+     * @allow Authenticated user 'A' (get) /users/A/settings/config
+     * @deny User 'B' (update) /users/A/settings/config
+     * @principle Ownership-based singleton management.
+     */
+    match /users/{userId}/settings/{settingId} {
+      allow get, list: if isOwner(userId);
+      allow create: if isOwner(userId) && (request.resource.data.id == settingId || settingId == 'config');
+      allow update: if isExistingOwner(userId) && isIdImmutable();
+      allow delete: if isExistingOwner(userId);
+    }
+
+    /**
+     * @description Manages property units.
+     * @path /users/{userId}/units/{unitId}
+     * @allow User '123' (create) /users/123/units/unit_abc where data.id == 'unit_abc'
+     * @deny User '123' (update) /users/123/units/unit_abc if they change the id field.
+     * @principle Relational integrity between document ID and internal metadata.
+     */
+    match /users/{userId}/units/{unitId} {
+      allow get, list: if isOwner(userId);
+      allow create: if isOwner(userId) && idMatchesPath(unitId);
+      allow update: if isExistingOwner(userId) && isIdImmutable();
+      allow delete: if isExistingOwner(userId);
+    }
+
+    /**
+     * @description Manages booking and reservation data.
+     * @path /users/{userId}/bookings/{bookingId}
+     * @allow User 'mgr_1' (list) /users/mgr_1/bookings
+     * @deny Anonymous user (get) /users/mgr_1/bookings/book_1
+     * @principle Structural segregation of private booking data.
+     */
+    match /users/{userId}/bookings/{bookingId} {
+      allow get, list: if isOwner(userId);
+      allow create: if isOwner(userId) && idMatchesPath(bookingId);
+      allow update: if isExistingOwner(userId) && isIdImmutable();
+      allow delete: if isExistingOwner(userId);
+    }
+
+    /**
+     * @description Tracks payments linked to bookings.
+     * @path /users/{userId}/payments/{paymentId}
+     * @allow User '1' (create) /users/1/payments/pay_1
+     * @deny User '2' (delete) /users/1/payments/pay_1
+     * @principle Strict isolation of financial records.
+     */
+    match /users/{userId}/payments/{paymentId} {
+      allow get, list: if isOwner(userId);
+      allow create: if isOwner(userId) && idMatchesPath(paymentId);
+      allow update: if isExistingOwner(userId) && isIdImmutable();
+      allow delete: if isExistingOwner(userId);
+    }
+
+    /**
+     * @description Tracks unit-specific or shared business expenses.
+     * @path /users/{userId}/expenses/{expenseId}
+     * @allow User 'admin' (update) /users/admin/expenses/exp_01
+     * @deny User 'admin' (create) /users/other/expenses/exp_01
+     * @principle Path-based authorization for financial tracking.
+     */
+    match /users/{userId}/expenses/{expenseId} {
+      allow get, list: if isOwner(userId);
+      allow create: if isOwner(userId) && idMatchesPath(expenseId);
+      allow update: if isExistingOwner(userId) && isIdImmutable();
+      allow delete: if isExistingOwner(userId);
+    }
+
+    /**
+     * @description Stores investor profile information.
+     * @path /users/{userId}/investors/{investorId}
+     * @allow User 'root' (get) /users/root/investors/inv_1
+     * @deny Unauthenticated user (list) /users/root/investors
+     * @principle Protection of sensitive investor contact details.
+     */
+    match /users/{userId}/investors/{investorId} {
+      allow get, list: if isOwner(userId);
+      allow create: if isOwner(userId) && idMatchesPath(investorId);
+      allow update: if isExistingOwner(userId) && isIdImmutable();
+      allow delete: if isExistingOwner(userId);
+    }
+
+    /**
+     * @description Manages profit-sharing assignments between investors and units.
+     * @path /users/{userId}/investorAssignments/{assignmentId}
+     * @allow User 'A' (create) /users/A/investorAssignments/asgn_1
+     * @deny User 'A' (update) if they attempt to change the assignment ID.
+     * @principle Relational consistency for business logic associations.
+     */
+    match /users/{userId}/investorAssignments/{assignmentId} {
+      allow get, list: if isOwner(userId);
+      allow create: if isOwner(userId) && idMatchesPath(assignmentId);
+      allow update: if isExistingOwner(userId) && isIdImmutable();
+      allow delete: if isExistingOwner(userId);
+    }
+
+    /**
+     * @description Stores agent profiles and commission rates.
+     * @path /users/{userId}/agents/{agentId}
+     * @allow Owner (delete) their own agent record.
+     * @deny User 'X' (get) agent record belonging to User 'Y'.
+     * @principle Path-based isolation for professional network data.
+     */
+    match /users/{userId}/agents/{agentId} {
+      allow get, list: if isOwner(userId);
+      allow create: if isOwner(userId) && idMatchesPath(agentId);
+      allow update: if isExistingOwner(userId) && isIdImmutable();
+      allow delete: if isExistingOwner(userId);
+    }
+
+    /**
+     * @description Manages dashboard task reminders.
+     * @path /users/{userId}/reminders/{reminderId}
+     * @allow User (update) 'completed' status on their own reminder.
+     * @deny User (list) reminders from another user's root path.
+     * @principle Scoped access to operational tasks.
+     */
+    match /users/{userId}/reminders/{reminderId} {
+      allow get, list: if isOwner(userId);
+      allow create: if isOwner(userId) && idMatchesPath(reminderId);
+      allow update: if isExistingOwner(userId) && isIdImmutable();
+      allow delete: if isExistingOwner(userId);
+    }
+
+    // Default deny for any paths not explicitly matched
+    match /{path=**} {
+      allow read, write: if false;
+    }
+  }
+}

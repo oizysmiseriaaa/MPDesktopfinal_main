@@ -1,0 +1,61 @@
+
+# Building Manila Prime for Tauri (Desktop)
+
+## 1. Prerequisites
+- **Rust**: [rustup.rs](https://rustup.rs/)
+- **Node.js**: v18 or later.
+
+## 2. Configuration Sync (CRITICAL)
+Open the `src-tauri/tauri.conf.json` and ensure these values match exactly:
+
+```json
+{
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devPath": "http://localhost:9002",
+    "distDir": "../out"
+  },
+  "tauri": {
+    "bundle": {
+      "active": true,
+      "targets": "all",
+      "identifier": "com.manilaprime.admin",
+      "icon": [
+        "icons/32x32.png",
+        "icons/128x128.png",
+        "icons/128x128@2x.png",
+        "icons/icon.icns",
+        "icons/icon.ico"
+      ]
+    },
+    "security": {
+      "csp": null
+    },
+    "window": {
+      "title": "Manila Prime Admin",
+      "width": 1280,
+      "height": 800,
+      "resizable": true,
+      "fullscreen": false
+    }
+  }
+}
+```
+
+## 3. The Build Process
+### Step A: Export the Web App
+This generates a static `out/` folder.
+```bash
+npm run build
+```
+
+### Step B: Verify the Export
+Check that a folder named `out` exists and contains an `index.html`. If it doesn't, the build failed.
+
+### Step C: Build the Native App
+This uses Rust to compile the native binary and bundle it with your static files.
+```bash
+npx tauri build
+```
+
