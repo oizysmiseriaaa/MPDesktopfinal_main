@@ -80,38 +80,29 @@ function toNumber(value: any, fallback = 0) {
 }
 
 function sanitizeExpensePayload(payload: Record<string, any>) {
-  const sanitized: Record<string, any> = {};
-
-  Object.entries(payload).forEach(([key, value]) => {
-    if (value === undefined || value === null) return;
-
-    if (typeof value === "string" && value.trim() === "") {
-      return;
-    }
+  const sanitizeValue = (value: any): any => {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value === "string" && value.trim() === "") return undefined;
 
     if (Array.isArray(value)) {
-      const cleaned = value.filter(
-        (item) => item !== undefined && item !== null && item !== "",
-      );
-      if (cleaned.length > 0) sanitized[key] = cleaned;
-      return;
+      return value.map(sanitizeValue).filter((item) => item !== undefined);
     }
 
     if (typeof value === "object") {
-      const objectValue = value as Record<string, any>;
-      const entries = Object.entries(objectValue).filter(
-        ([, nestedValue]) => nestedValue !== undefined && nestedValue !== null,
+      const sanitizedObject = Object.fromEntries(
+        Object.entries(value)
+          .map(([key, nestedValue]) => [key, sanitizeValue(nestedValue)])
+          .filter(([, nestedValue]) => nestedValue !== undefined),
       );
-      if (entries.length > 0) {
-        sanitized[key] = Object.fromEntries(entries);
-      }
-      return;
+      return Object.keys(sanitizedObject).length > 0
+        ? sanitizedObject
+        : undefined;
     }
 
-    sanitized[key] = value;
-  });
+    return value;
+  };
 
-  return sanitized;
+  return sanitizeValue(payload) ?? {};
 }
 
 const UnitCheckboxRow = React.memo(function UnitCheckboxRow({
@@ -453,10 +444,7 @@ export default function ExpensesClient() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.setAttribute(
-      "download",
-      `expenses-${todayLocalDateInput()}.csv`,
-    );
+    link.setAttribute("download", `expenses-${todayLocalDateInput()}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);

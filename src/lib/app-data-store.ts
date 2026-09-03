@@ -33,7 +33,6 @@ type ErrorMap = Partial<Record<ResourceName, string | null>>;
 type SourceMap = Partial<Record<ResourceName, "firestore" | "api">>;
 
 const TTL_MS = 5 * 60_000;
-const SNAPSHOT_IGNORE_MS = 5_000;
 
 const RESOURCE_CONFIG: Record<
   ResourceName,
@@ -83,7 +82,6 @@ async function tryReadFromFirestore(
 // security-deposits (and other) collections without a page refresh.
 const realtimeUnsubscribers = new Map<string, () => void>();
 let listenerOwnerId: string | null = null;
-const snapshotIgnoreUntil = new Map<string, number>();
 const activeResources = new Set<ResourceName>();
 
 function resetRealtimeStateForUser(userId: string | null) {
@@ -91,7 +89,6 @@ function resetRealtimeStateForUser(userId: string | null) {
   realtimeUnsubscribers.forEach((unsubscribe) => unsubscribe());
   realtimeUnsubscribers.clear();
   listenerOwnerId = userId;
-  snapshotIgnoreUntil.clear();
   activeResources.clear();
   useAppDataStore.setState({
     data: {},
@@ -135,8 +132,6 @@ function ensureRealtimeSync(
       const unsub = onSnapshot(
         ref,
         (snapshot) => {
-          const ignoreUntil = snapshotIgnoreUntil.get(subscriptionKey) || 0;
-          if (Date.now() < ignoreUntil) return;
           const docs = snapshot.docs.map((docItem: any) => ({
             ...docItem.data(),
             id: docItem.id,
@@ -146,7 +141,7 @@ function ensureRealtimeSync(
             const current = s.data[resource];
             if (
               hasUsableData(current) &&
-              shallowEqualArrays(current, normalized)
+              equalResourceRecords(current, normalized)
             ) {
               return s;
             }
@@ -179,15 +174,40 @@ function hasUsableData(value: unknown): value is any[] {
   return Array.isArray(value);
 }
 
-function shallowEqualArrays(a: any[], b: any[]): boolean {
+// A document can retain the same ID while its dates, guest, payment state, or
+// related fields change. Comparing IDs alone caused every booking consumer to
+// retain stale reservation data until a manual refresh.
+export function equalResourceRecords(a: any[], b: any[]): boolean {
   if (a === b) return true;
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) {
-    if (String(a[i]?.id || a[i]?.bookingId || "") !== String(b[i]?.id || b[i]?.bookingId || "")) {
+    if (
+      String(a[i]?.id || a[i]?.bookingId || "") !==
+        String(b[i]?.id || b[i]?.bookingId || "") ||
+      JSON.stringify(a[i]) !== JSON.stringify(b[i])
+    ) {
       return false;
     }
   }
   return true;
+}
+
+export function removeBookingRelatedRecords(
+  resource: ResourceName,
+  records: any[],
+  bookingId: string,
+) {
+  const targetId = String(bookingId || "").trim();
+  if (!targetId) return records;
+  return records.filter((record) => {
+    const recordId = String(record?.id || record?.bookingId || "").trim();
+    const relatedId = String(
+      record?.bookingId || record?.booking_id || "",
+    ).trim();
+    return resource === "bookings"
+      ? recordId !== targetId
+      : relatedId !== targetId;
+  });
 }
 
 // Older calendar sync runs created documents from rate-only cells. They are
@@ -243,6 +263,7 @@ type StoreState = {
     force?: boolean,
   ) => Promise<void>;
   invalidateResources: (resources: ResourceName[]) => void;
+  removeBookingRelatedData: (bookingId: string) => void;
 };
 
 export const useAppDataStore = create<StoreState>((set, get) => ({
@@ -281,20 +302,22 @@ export const useAppDataStore = create<StoreState>((set, get) => ({
 
         try {
           if (force) {
-            snapshotIgnoreUntil.set(
-              `${resource}:${RESOURCE_CONFIG[resource].firestoreCollections[0]}`,
-              Date.now() + SNAPSHOT_IGNORE_MS,
-            );
             const apiData = await apiClient.get<any[]>(
               RESOURCE_CONFIG[resource].endpoint,
               ctx.auth ?? undefined,
             );
             if (Array.isArray(apiData)) {
-              const normalizedApiData = normalizeResourceData(resource, apiData);
+              const normalizedApiData = normalizeResourceData(
+                resource,
+                apiData,
+              );
               set((s) => ({
                 data: { ...s.data, [resource]: normalizedApiData },
                 loading: { ...s.loading, [resource]: false },
-                backgroundLoading: { ...s.backgroundLoading, [resource]: false },
+                backgroundLoading: {
+                  ...s.backgroundLoading,
+                  [resource]: false,
+                },
                 loadedAt: { ...s.loadedAt, [resource]: Date.now() },
                 source: { ...s.source, [resource]: "api" },
               }));
@@ -394,6 +417,28 @@ export const useAppDataStore = create<StoreState>((set, get) => ({
       return { loadedAt, errors };
     });
   },
+  removeBookingRelatedData: (bookingId) => {
+    set((s) => {
+      const data = { ...s.data };
+      (
+        [
+          "bookings",
+          "booking-payments",
+          "security-deposits",
+          "reminders",
+          "expenses",
+        ] as ResourceName[]
+      ).forEach((resource) => {
+        if (!Array.isArray(data[resource])) return;
+        data[resource] = removeBookingRelatedRecords(
+          resource,
+          data[resource] || [],
+          bookingId,
+        );
+      });
+      return { data };
+    });
+  },
 }));
 
 type UseAppResourcesOptions = {
@@ -410,6 +455,9 @@ export function useAppResources(
   const { role } = useUserRole();
   const ensureResources = useAppDataStore((s) => s.ensureResources);
   const invalidateResources = useAppDataStore((s) => s.invalidateResources);
+  const removeBookingRelatedData = useAppDataStore(
+    (s) => s.removeBookingRelatedData,
+  );
   const data = useAppDataStore((s) => s.data);
   const loadingMap = useAppDataStore((s) => s.loading);
   const backgroundLoadingMap = useAppDataStore((s) => s.backgroundLoading);
@@ -496,6 +544,7 @@ export function useAppResources(
       error: errors || null,
       refresh,
       invalidate: invalidateResources,
+      removeBookingRelatedData,
     };
   }, [
     resourceList,
@@ -505,6 +554,7 @@ export function useAppResources(
     errorMap,
     invalidateResources,
     refresh,
+    removeBookingRelatedData,
     options?.preloadOnly,
   ]);
 }

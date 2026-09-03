@@ -36,6 +36,16 @@ const imageData = async (source: string) => {
   });
 };
 
+// The representative signature is a local optional asset. A missing file must
+// never prevent a quotation or SOA from being generated.
+const optionalImageData = async (source: string) => {
+  try {
+    return await imageData(source);
+  } catch {
+    return null;
+  }
+};
+
 const safeName = (value: string) =>
   value.replace(/[^a-z0-9]+/gi, "").slice(0, 80) || "Guest";
 
@@ -49,6 +59,60 @@ const documentSequence = (booking: any) => {
   for (let index = 0; index < id.length; index += 1)
     hash = (hash * 31 + id.charCodeAt(index)) >>> 0;
   return String((hash % 9999) + 1).padStart(4, "0");
+};
+
+// Read-only reconciliation for the existing booking fields. The application
+// continues to own pricing and payment persistence; this prevents documents
+// from presenting mutually inconsistent line totals and balances.
+export const calculateBookingDocumentFinancials = (booking: any, unit: any) => {
+  const stayDuration =
+    (new Date(booking?.checkoutDate).getTime() -
+      new Date(booking?.checkinDate).getTime()) /
+    86400000;
+  const nights = Number.isFinite(stayDuration)
+    ? Math.max(0, Math.round(stayDuration))
+    : 0;
+  const roomCharge = numeric(booking?.totalAmount);
+  const configuredRate = numeric(booking?.nightlyRate ?? unit?.rate);
+  // A custom total is authoritative. Deriving the displayed unit price makes
+  // the document's quantity × unit price always match its stored line total.
+  const rate = nights > 0 && Math.abs(configuredRate * nights - roomCharge) > 0.01
+    ? roomCharge / nights
+    : configuredRate;
+  const deposit = numeric(
+    booking?.securityDeposit?.amount ?? booking?.securityDepositAmount,
+  );
+  const additional = numeric(
+    booking?.additionalCharges ?? booking?.additionalCharge,
+  );
+  const discount = numeric(booking?.discount ?? booking?.discountAmount);
+  const subtotal = roomCharge + additional;
+  const grandTotal = subtotal + deposit - discount;
+  // `paidTotal` is maintained by the booking-payment ledger. Prefer it over
+  // the legacy nested draft amount, then include the separately tracked
+  // refundable-deposit receipt when it has actually been received.
+  const bookingPayment = numeric(
+    booking?.paidTotal ?? booking?.bookingPayment?.amount ?? booking?.amountPaid,
+  );
+  const depositPayment = numeric(
+    booking?.securityDepositReceipt?.amount ?? booking?.depositReceivedAmount,
+  );
+  const paid = bookingPayment + depositPayment;
+  const balanceDue = grandTotal - paid;
+  return {
+    nights,
+    rate,
+    roomCharge,
+    deposit,
+    additional,
+    discount,
+    subtotal,
+    grandTotal,
+    bookingPayment,
+    depositPayment,
+    paid,
+    balanceDue,
+  };
 };
 
 export async function createBookingPdf({
@@ -73,30 +137,22 @@ export async function createBookingPdf({
     `${booking?.guestFirstName || ""} ${booking?.guestLastName || ""}`.trim() ||
     booking?.guestName ||
     "Valued Guest";
-  const nights = Math.max(
-    0,
-    Math.round(
-      (new Date(booking?.checkoutDate).getTime() -
-        new Date(booking?.checkinDate).getTime()) /
-        86400000,
-    ),
-  );
+  const financials = calculateBookingDocumentFinancials(booking, unit);
+  const {
+    nights,
+    rate,
+    roomCharge,
+    deposit,
+    additional,
+    discount,
+    subtotal,
+    grandTotal,
+    bookingPayment,
+    depositPayment,
+    paid,
+    balanceDue,
+  } = financials;
   const pax = numeric(booking?.adults, 0) + numeric(booking?.children, 0);
-  const rate = numeric(unit?.rate ?? booking?.nightlyRate);
-  const roomCharge = numeric(booking?.totalAmount);
-  const deposit = numeric(
-    booking?.securityDeposit?.amount ?? booking?.securityDepositAmount,
-  );
-  const additional = numeric(
-    booking?.additionalCharges ?? booking?.additionalCharge,
-  );
-  const discount = numeric(booking?.discount ?? booking?.discountAmount);
-  const grandTotal = numeric(booking?.grandTotal ?? booking?.totalAmount);
-  const paid = numeric(booking?.bookingPayment?.amount ?? booking?.amountPaid);
-  const remaining = numeric(
-    booking?.remainingBalance,
-    Math.max(0, grandTotal - paid),
-  );
   const status =
     booking?.paymentStatus ||
     booking?.bookingPaymentStatus ||
@@ -109,19 +165,19 @@ export async function createBookingPdf({
 
   const [logo, signature] = await Promise.all([
     imageData("/manila-prime-staycation-logo.png"),
-    imageData("/representative-signature.png"),
+    optionalImageData("/rep_sig.png"),
   ]);
-  pdf.addImage(logo, "PNG", left, 14, 34, 20);
+  pdf.addImage(logo, "PNG", left, 15, 28, 16);
   pdf.setTextColor(30, 30, 30);
   pdf.setFont("helvetica", "bold");
   pdf.setFontSize(16);
-  pdf.text("MANILA PRIME STAYCATION", 56, 22);
+  pdf.text("MANILA PRIME STAYCATION", 50, 22);
   pdf.setFont("helvetica", "normal");
   pdf.setFontSize(8);
-  pdf.text("Professional staycation management", 56, 27);
-  pdf.setFillColor(17, 24, 39);
-  pdf.roundedRect(132, 14, 60, 21, 2, 2, "F");
-  pdf.setTextColor(255, 255, 255);
+  pdf.text("Professional staycation management", 50, 27);
+  // Keep both documents in the same visual system. Their labels and account
+  // data differ, but the header, typography, and placement are identical.
+  pdf.setTextColor(30, 30, 30);
   pdf.setFont("helvetica", "bold");
   pdf.setFontSize(12);
   pdf.text(
@@ -210,9 +266,13 @@ export async function createBookingPdf({
   pdf.line(left, y, right, y);
   y += 11;
 
-  const summary: Array<[string, number]> = [["Room Charge", roomCharge]];
-  if (deposit > 0) summary.push(["Security Deposit", deposit]);
+  const summary: Array<[string, number]> =
+    type === "quotation" ? [["Room Charge", roomCharge]] : [["Subtotal", subtotal]];
+  if (type === "quotation" && deposit > 0)
+    summary.push(["Security Deposit", deposit]);
   if (additional !== 0) summary.push(["Additional Charges", additional]);
+  if (type === "statement" && deposit !== 0)
+    summary.push(["Security Deposit", deposit]);
   if (discount !== 0) summary.push(["Discount", discount]);
   summary.push(["Grand Total", grandTotal]);
   pdf.setFontSize(9);
@@ -229,15 +289,23 @@ export async function createBookingPdf({
     pdf.setDrawColor(210, 210, 210);
     pdf.line(128, y, right, y);
     y += 7;
-    [
-      ["Amount Paid", paid],
-      ["Remaining Balance", remaining],
-    ].forEach(([label, amount]) => {
+    const payments: Array<[string, number]> = [
+      ["Booking Payments Received", bookingPayment],
+    ];
+    if (depositPayment !== 0)
+      payments.push(["Deposit Received", depositPayment]);
+    payments.push(["Total Payments Received", paid]);
+    payments.forEach(([label, amount]) => {
       pdf.setFont("helvetica", "bold");
       pdf.text(String(label), 132, y);
       pdf.text(money(amount), right, y, { align: "right" });
       y += 7;
     });
+    const hasCredit = balanceDue < 0;
+    pdf.setFont("helvetica", "bold");
+    pdf.text(hasCredit ? "Credit Balance" : "Remaining Balance", 132, y);
+    pdf.text(money(Math.abs(balanceDue)), right, y, { align: "right" });
+    y += 7;
     pdf.text("Payment Status", 132, y);
     pdf.text(String(status), right, y, { align: "right" });
     y += 10;
@@ -253,17 +321,9 @@ export async function createBookingPdf({
   y += 7;
   pdf.setFont("helvetica", "normal");
   pdf.setFontSize(9);
-  // Print-safe monochrome bank and wallet marks, drawn as vectors so the PDF has no emoji dependency.
-  pdf.setDrawColor(30, 30, 30);
-  pdf.setFillColor(30, 30, 30);
-  pdf.triangle(left, y - 4, left + 4, y - 8, left + 8, y - 4, "F");
-  pdf.rect(left + 1, y - 3, 6, 1, "F");
-  pdf.rect(108, y - 7, 9, 6, "S");
-  pdf.line(108, y - 5, 117, y - 5);
-  pdf.circle(115, y - 3, 0.6, "F");
   pdf.setFont("helvetica", "bold");
-  pdf.text("BDO Bank", left + 11, y);
-  pdf.text("GCash", 120, y);
+  pdf.text("BDO Bank", left, y);
+  pdf.text("GCash", 108, y);
   y += 5;
   pdf.setFont("helvetica", "normal");
   pdf.text("Account Number: 012700035484", left, y);
@@ -271,17 +331,29 @@ export async function createBookingPdf({
   y += 5;
   pdf.text("Account Name: Manila Prime Staycation", left, y);
   pdf.text("Account Name: Jo...N. P.", 108, y);
-  y += 15;
-  pdf.addImage(signature, "PNG", left, y - 11, 39, 13);
+  // Give the signed section more breathing room beneath the payment details.
+  y += type === "statement" ? (signature ? 12 : 10) : signature ? 20 : 14;
+  if (signature) {
+    // Preserve the signature's aspect ratio; it sits cleanly above the
+    // representative's printed name rather than being stretched to a box.
+    const signatureProperties = pdf.getImageProperties(signature);
+    const signatureWidth = 39;
+    const signatureHeight = Math.min(
+      18,
+      signatureWidth * (signatureProperties.height / signatureProperties.width),
+    );
+    // Let the lower stroke sit naturally into the upper portion of the name.
+    pdf.addImage(signature, "PNG", left, y + 8 - signatureHeight, signatureWidth, signatureHeight);
+  }
   pdf.setDrawColor(120, 120, 120);
-  pdf.line(left, y + 4, left + 52, y + 4);
+  pdf.line(left, y + 10, left + 52, y + 10);
   pdf.setFont("helvetica", "bold");
   pdf.setFontSize(9);
-  pdf.text("Rey Arjay R. Patiag", left, y + 9);
+  pdf.text("Rey Arjay R. Patiag", left, y + 15);
   pdf.setFont("helvetica", "normal");
   pdf.setFontSize(8);
-  pdf.text("Authorized Representative", left, y + 14);
-  pdf.text(`Prepared by: ${preparedBy || "Current Administrator"}`, 108, y + 9);
+  pdf.text("Authorized Representative", left, y + 20);
+  pdf.text(`Prepared by: ${preparedBy || "Current Administrator"}`, 108, y + 15);
   pdf.setTextColor(115, 115, 115);
   pdf.setFontSize(7);
   pdf.text("This document was generated by HostFlow.", pageWidth / 2, 287, {

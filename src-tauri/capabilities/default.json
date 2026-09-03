@@ -1,12 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "enables core, booking image, and generated document save permissions",
+  "description": "enables core and desktop booking export permissions",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "notification:default",
     "fs:allow-mkdir",
+    "fs:allow-exists",
     "fs:allow-write-file",
     {
       "identifier": "fs:scope",
@@ -18,15 +19,7 @@
         { "path": "$DESKTOP/ManilaPrime/Quotations" },
         { "path": "$DESKTOP/ManilaPrime/Quotations/*" },
         { "path": "$DESKTOP/ManilaPrime/SOA" },
-        { "path": "$DESKTOP/ManilaPrime/SOA/*" },
-        { "path": "$DESKTOP/ManilaPrime/HostFlow" },
-        { "path": "$DESKTOP/ManilaPrime/HostFlow/*" },
-        { "path": "$DOCUMENT/HostFlow" },
-        { "path": "$DOCUMENT/HostFlow/*" },
-        { "path": "$DOCUMENT/HostFlow/Quotations" },
-        { "path": "$DOCUMENT/HostFlow/Quotations/*" },
-        { "path": "$DOCUMENT/HostFlow/Statements of Account" },
-        { "path": "$DOCUMENT/HostFlow/Statements of Account/*" }
+        { "path": "$DESKTOP/ManilaPrime/SOA/*" }
       ]
     }
   ]

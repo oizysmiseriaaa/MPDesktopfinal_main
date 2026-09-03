@@ -155,6 +155,12 @@ export default function RemindersClient() {
               `Failed to auto-create housekeeping reminder for booking ${bookingId}:`,
               error,
             );
+            toast({
+              variant: "destructive",
+              title: "Housekeeping reminder unavailable",
+              description:
+                "A housekeeping reminder could not be created automatically. The booking was not blocked, and the reminder will be retried later.",
+            });
           }
           housekeepingCreatedRef.current.delete(task.id);
         }
@@ -242,6 +248,12 @@ export default function RemindersClient() {
     } catch (error: any) {
       // The reminder update already succeeded — keep the failure non-fatal.
       console.error("Failed to create housekeeping task:", error);
+      toast({
+        variant: "destructive",
+        title: "Housekeeping reminder unavailable",
+        description:
+          "The automatic housekeeping reminder could not be created. The booking remained saved.",
+      });
     }
   };
 

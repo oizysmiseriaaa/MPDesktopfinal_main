@@ -55,6 +55,7 @@ import {
   Tooltip,
 } from "recharts";
 import Link from "next/link";
+import { getBookingSourceColor } from "@/lib/booking-source";
 
 export function shouldAttemptAutomaticInsight(
   hasData: boolean,
@@ -393,7 +394,9 @@ export default function DashboardClient() {
   const channelSourceData = useMemo(() => {
     const sourceCounts: Record<string, number> = {};
     apiData.bookings.forEach((booking) => {
-      const source = normalizeChannelSource(booking.source);
+      const source = normalizeChannelSource(
+        booking.bookingSource || booking.source,
+      );
       sourceCounts[source] = (sourceCounts[source] || 0) + 1;
     });
 
@@ -415,13 +418,13 @@ export default function DashboardClient() {
   }, [apiData.bookings]);
 
   const channelColors: Record<string, string> = {
-    Direct: "bg-amber-500",
-    "Direct Booking": "bg-amber-500",
-    Facebook: "bg-emerald-500",
-    Airbnb: "bg-sky-500",
-    "Booking.com": "bg-blue-600",
-    "Staff / Referral": "bg-violet-500",
-    Other: "bg-rose-500",
+    Direct: getBookingSourceColor("N/A"),
+    "Direct Booking": getBookingSourceColor("N/A"),
+    Facebook: getBookingSourceColor("Facebook Page"),
+    Airbnb: getBookingSourceColor("Airbnb"),
+    "Booking.com": getBookingSourceColor("Booking.com"),
+    "Staff / Referral": getBookingSourceColor("Staff"),
+    Other: getBookingSourceColor("N/A"),
   };
 
   const housekeepingTasks = useMemo(() => {
@@ -1127,7 +1130,7 @@ export default function DashboardClient() {
                   name={source.name}
                   count={source.count}
                   percent={source.percent}
-                  color={channelColors[source.name] || "bg-slate-500"}
+                  color={channelColors[source.name] || getBookingSourceColor("N/A")}
                 />
               ))
             ) : (
@@ -1300,8 +1303,8 @@ function ChannelRow({
       </span>
       <div className="h-2 flex-1 overflow-hidden rounded-full bg-muted">
         <div
-          className={cn("h-full rounded-full", color)}
-          style={{ width: `${percent}%` }}
+          className="h-full rounded-full"
+          style={{ width: `${percent}%`, backgroundColor: color }}
         />
       </div>
       <span className="w-10 shrink-0 text-right text-xs font-bold text-foreground">

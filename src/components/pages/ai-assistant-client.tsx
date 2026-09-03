@@ -11,8 +11,10 @@ import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
 import { apiClient } from "@/lib/api-client"
 import { useToast } from "@/hooks/use-toast"
+import { useAuth } from "@/firebase"
 
 export default function AIAssistantClient() {
+  const auth = useAuth()
   const { toast } = useToast()
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState("")
@@ -43,7 +45,7 @@ export default function AIAssistantClient() {
         guestInquiry,
         listingDetails,
         hostInstructions
-      });
+      }, auth);
       setResult(generatedResponse)
     } catch (error: any) {
       console.error("AI Error:", error);
@@ -78,7 +80,7 @@ export default function AIAssistantClient() {
         amenities: amenities.split(',').map(s => s.trim()),
         uniqueSellingPoints: ["Amazing view", "Walking distance to town"],
         targetAudience: "Families"
-      });
+      }, auth);
       setResult(description)
     } catch (error: any) {
       console.error("AI Error:", error);

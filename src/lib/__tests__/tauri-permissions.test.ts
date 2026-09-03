@@ -10,9 +10,17 @@ const capabilityPath = resolve(
 );
 
 describe("Tauri desktop export permissions", () => {
-  it("allows quotation and SOA folders under ManilaPrime on the desktop", () => {
+  it("allows Desktop/ManilaPrime export folders", () => {
     const capabilityConfig = readFileSync(capabilityPath, "utf8");
 
+    expect(capabilityConfig).toContain('"path": "$DESKTOP/ManilaPrime"');
+    expect(capabilityConfig).toContain('"path": "$DESKTOP/ManilaPrime/*"');
+    expect(capabilityConfig).toContain(
+      '"path": "$DESKTOP/ManilaPrime/Bookings"',
+    );
+    expect(capabilityConfig).toContain(
+      '"path": "$DESKTOP/ManilaPrime/Bookings/*"',
+    );
     expect(capabilityConfig).toContain(
       '"path": "$DESKTOP/ManilaPrime/Quotations"',
     );
@@ -21,5 +29,6 @@ describe("Tauri desktop export permissions", () => {
     );
     expect(capabilityConfig).toContain('"path": "$DESKTOP/ManilaPrime/SOA"');
     expect(capabilityConfig).toContain('"path": "$DESKTOP/ManilaPrime/SOA/*"');
+    expect(capabilityConfig).toContain('"fs:allow-exists"');
   });
 });

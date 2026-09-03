@@ -1,5 +1,19 @@
 "use client";
 
+function removeUndefinedDeep(value: any): any {
+  if (Array.isArray(value)) {
+    return value.map(removeUndefinedDeep);
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, entryValue]) => entryValue !== undefined)
+        .map(([key, entryValue]) => [key, removeUndefinedDeep(entryValue)]),
+    );
+  }
+  return value;
+}
+
 import { useState, useEffect, useMemo, useRef, type FormEvent } from "react";
 import { useUser, useAuth } from "@/firebase";
 import { apiClient } from "@/lib/api-client";
@@ -43,16 +57,30 @@ import {
 import { cn } from "@/lib/utils";
 import { useDialogCleanup } from "@/hooks/use-dialog-cleanup";
 import html2canvas from "html2canvas";
+import { createBookingPdf, type BookingDocumentType } from "@/lib/booking-pdf";
+import {
+  getBookingSourceColor,
+  getBookingSourceDisplayName,
+  getBookingSourceLabel,
+} from "@/lib/booking-source";
 import { BookingDetailsDialog } from "./booking-details-dialog";
 import { useUserRole } from "@/hooks/use-user-role";
 import { canManageOperations } from "@/auth/roles";
 
-function dataUrlToUint8Array(dataUrl: string) {
-  const base64 = dataUrl.split(",")[1] || "";
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-  return bytes;
+function canvasToPngBytes(canvas: HTMLCanvasElement): Promise<Uint8Array> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(async (blob) => {
+      if (!blob) {
+        reject(new Error("Unable to encode the booking image."));
+        return;
+      }
+      try {
+        resolve(new Uint8Array(await blob.arrayBuffer()));
+      } catch (error) {
+        reject(error);
+      }
+    }, "image/png");
+  });
 }
 
 function toNumber(value: any, fallback = 0) {
@@ -174,7 +202,7 @@ function SignatureBlock() {
       <p className="font-bold mb-4">Prepared By:</p>
       <div className="p-0 relative overflow-visible">
         <img
-          src="/representative-signature.png"
+          src="/rep_sig.png"
           alt="Signature"
           className="relative z-30 h-[340px] max-w-[520px] w-full object-contain bg-transparent"
         />
@@ -213,6 +241,7 @@ export default function BookingsClient() {
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [editingBooking, setEditingBooking] = useState<any>(null);
   const [formLoading, setFormLoading] = useState(false);
+  const [imageSaving, setImageSaving] = useState(false);
   const [documentLoading, setDocumentLoading] = useState<
     "quotation" | "statement" | null
   >(null);
@@ -349,22 +378,6 @@ export default function BookingsClient() {
     return `ManilaPrime/Bookings/${date}_${unitName}_${identifier}.png`;
   };
 
-  const buildQuotationImageRelativePath = (booking: any) => {
-    const identifier = sanitizePathSegment(
-      booking?.id || `${booking?.guestFirstName}-${booking?.guestLastName}`,
-      "booking",
-    );
-    return `ManilaPrime/Quotations/${buildDocumentNumber(booking, "MPS")}_${identifier}.png`;
-  };
-
-  const buildSoaImageRelativePath = (booking: any) => {
-    const identifier = sanitizePathSegment(
-      booking?.id || `${booking?.guestFirstName}-${booking?.guestLastName}`,
-      "booking",
-    );
-    return `ManilaPrime/SOA/${buildDocumentNumber(booking, "MPS")}_${identifier}.png`;
-  };
-
   const formatBookingCardDate = (value: string | undefined) => {
     if (!value) return "-";
     const parsed = new Date(value);
@@ -411,23 +424,26 @@ export default function BookingsClient() {
 
   const handleSaveBookingImage = async () => {
     if (!editingBooking || !bookingSummaryCardRef.current) return;
+    setImageSaving(true);
     try {
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame(() => resolve()),
+      );
       const canvas = await html2canvas(bookingSummaryCardRef.current, {
         backgroundColor: "#0B0B0B",
-        scale: 2,
+        scale: 1,
+        logging: false,
       });
       const relativePath = buildBookingImageRelativePath(editingBooking);
       const { mkdir, writeFile, BaseDirectory } =
         await import("@tauri-apps/plugin-fs");
-      await mkdir("ManilaPrime/Bookings", {
+      await mkdir("Bookings", {
         baseDir: BaseDirectory.Desktop,
         recursive: true,
       });
-      await writeFile(
-        relativePath,
-        dataUrlToUint8Array(canvas.toDataURL("image/png")),
-        { baseDir: BaseDirectory.Desktop },
-      );
+      await writeFile(relativePath, await canvasToPngBytes(canvas), {
+        baseDir: BaseDirectory.Desktop,
+      });
       toast({
         title: "Image saved",
         description: `Saved to Desktop/${relativePath}`,
@@ -438,78 +454,64 @@ export default function BookingsClient() {
         title: "Image save failed",
         description: error.message,
       });
+    } finally {
+      setImageSaving(false);
     }
   };
 
-  const handleGenerateQuotation = async () => {
-    if (!editingBooking || !quotationSnapshotRef.current) return;
-    setDocumentLoading("quotation");
+  // Reuse the shared PDF generator used by the Calendar. The old hidden-DOM
+  // screenshot export could fail before a file was written (especially in the
+  // desktop shell), leaving a misleading "Statement save failed" message.
+  const handleGenerateBookingDocument = async (type: BookingDocumentType) => {
+    if (!editingBooking?.id) return;
+    setDocumentLoading(type);
     try {
-      const canvas = await html2canvas(quotationSnapshotRef.current, {
-        backgroundColor: "#FFFFFF",
-        scale: 2,
+      const document = await createBookingPdf({
+        type,
+        booking: editingBooking,
+        unit: findUnitForBooking(editingBooking.unitId),
+        preparedBy: user?.displayName || user?.email || null,
       });
-      const relativePath = buildQuotationImageRelativePath(editingBooking);
+      if (!document.bytes?.length) throw new Error("Generated PDF is empty.");
+
       const { mkdir, writeFile, BaseDirectory } =
         await import("@tauri-apps/plugin-fs");
-      await mkdir("ManilaPrime/Quotations", {
+      const folder =
+        type === "quotation" ? "ManilaPrime/Quotations" : "ManilaPrime/SOA";
+      const path = `${folder}/${document.fileName}`;
+      await mkdir(folder, {
         baseDir: BaseDirectory.Desktop,
         recursive: true,
       });
-      await writeFile(
-        relativePath,
-        dataUrlToUint8Array(canvas.toDataURL("image/png")),
-        { baseDir: BaseDirectory.Desktop },
-      );
+      await writeFile(path, document.bytes, {
+        baseDir: BaseDirectory.Desktop,
+        create: true,
+      });
       toast({
-        title: "Quotation saved",
-        description: `Saved to Desktop/${relativePath}`,
+        title:
+          type === "quotation"
+            ? "Quotation generated"
+            : "Statement of Account generated",
+        description: `Saved to Desktop/${path}`,
       });
     } catch (error: any) {
+      const message =
+        error instanceof Error ? error.message : "Unable to save the PDF.";
+      console.error("Booking document generation failed", error);
       toast({
         variant: "destructive",
-        title: "Quotation save failed",
-        description: error.message,
+        title: "Document generation failed",
+        description: message,
       });
     } finally {
       setDocumentLoading(null);
     }
   };
 
-  const handleGenerateStatement = async () => {
-    if (!editingBooking || !soaSnapshotRef.current) return;
-    setDocumentLoading("statement");
-    try {
-      const canvas = await html2canvas(soaSnapshotRef.current, {
-        backgroundColor: "#FFFFFF",
-        scale: 2,
-      });
-      const relativePath = buildSoaImageRelativePath(editingBooking);
-      const { mkdir, writeFile, BaseDirectory } =
-        await import("@tauri-apps/plugin-fs");
-      await mkdir("ManilaPrime/SOA", {
-        baseDir: BaseDirectory.Desktop,
-        recursive: true,
-      });
-      await writeFile(
-        relativePath,
-        dataUrlToUint8Array(canvas.toDataURL("image/png")),
-        { baseDir: BaseDirectory.Desktop },
-      );
-      toast({
-        title: "Statement saved",
-        description: `Saved to Desktop/${relativePath}`,
-      });
-    } catch (error: any) {
-      toast({
-        variant: "destructive",
-        title: "Statement save failed",
-        description: error.message,
-      });
-    } finally {
-      setDocumentLoading(null);
-    }
-  };
+  const handleGenerateQuotation = () =>
+    handleGenerateBookingDocument("quotation");
+  const handleGenerateStatement = () =>
+    handleGenerateBookingDocument("statement");
 
   const makeDefaultBooking = () => {
     const today = todayLocalDateInput();
@@ -523,6 +525,8 @@ export default function BookingsClient() {
       children: 0,
       agentId: "",
       agentName: "",
+      bookingSource: "N/A",
+      bookingLabel: "N/A",
       isCustomAmount: false,
       totalAmount: 0,
       securityDeposit: { amount: 1000, status: "Unpaid" },
@@ -572,7 +576,13 @@ export default function BookingsClient() {
         status: depositStatus,
       },
       bookingPayment: {
-        amount: toNumber(booking?.bookingPayment?.amount, 0),
+        // The server's ledger reconciliation is authoritative. Older booking
+        // records can keep the initial nested amount at zero while `paidTotal`
+        // is current, which made the edit form and SOA appear unpaid.
+        amount: toNumber(
+          booking?.paidTotal ?? booking?.bookingPayment?.amount,
+          0,
+        ),
         paidAt: toDateInput(booking?.bookingPayment?.paidAt),
         method: booking?.bookingPayment?.method || "CASH",
         reference: booking?.bookingPayment?.reference || "",
@@ -632,6 +642,10 @@ export default function BookingsClient() {
         uid: user?.uid,
         isCustomAmount: true,
         agentName: selectedAgent?.name || "",
+        bookingSource: editingBooking?.bookingSource || "N/A",
+        bookingLabel: getBookingSourceLabel(
+          editingBooking?.bookingSource || "N/A",
+        ),
         totalAmount: finalTotalAmount,
         paymentStatus,
         bookingPaymentStatus: paymentStatus,
@@ -650,14 +664,31 @@ export default function BookingsClient() {
           status: depositStatus,
         },
       };
+      const sanitizedPayload = removeUndefinedDeep(payload);
 
       let savedBookingId = editingBooking?.id || "";
       if (editingBooking?.id) {
-        await apiClient.put(`/booking/${editingBooking.id}`, payload, auth);
+        await apiClient.put(
+          `/booking/${editingBooking.id}`,
+          sanitizedPayload,
+          auth,
+        );
         toast({ title: "Success", description: "Booking updated." });
       } else {
-        const res = await apiClient.post<any>("/booking", payload, auth);
+        const res = await apiClient.post<any>(
+          "/booking",
+          sanitizedPayload,
+          auth,
+        );
         savedBookingId = res?.id || res?.data?.id || "";
+
+        // Validate that booking was actually created with an ID
+        if (!savedBookingId) {
+          throw new Error(
+            "Server response missing booking ID. Please refresh and verify the booking was created.",
+          );
+        }
+
         toast({ title: "Success", description: "New booking created." });
       }
 
@@ -707,6 +738,11 @@ export default function BookingsClient() {
             );
           } catch (err) {
             console.error("Failed to create agent commission:", err);
+            toast({
+              variant: "destructive",
+              title: "Warning",
+              description: `Booking saved but agent commission creation failed. Please create the commission manually.`,
+            });
           }
         }
       }
@@ -748,9 +784,9 @@ export default function BookingsClient() {
         setIsDialogOpen(false);
         setEditingBooking(null);
       }
-      await bookingsResources.refresh();
-      // Invalidate payment/deposit caches so Payments page shows fresh data
-      bookingsResources.invalidate(["booking-payments", "security-deposits"]);
+      // Remove it immediately from the shared reservation store. Firestore
+      // listeners then confirm the canonical deletion for every open page.
+      bookingsResources.removeBookingRelatedData(String(booking.id));
     } catch (error: any) {
       toast({
         variant: "destructive",
@@ -946,6 +982,7 @@ export default function BookingsClient() {
               <TableHead className="font-bold">Check-in</TableHead>
               <TableHead className="font-bold">Guest</TableHead>
               <TableHead className="font-bold">Unit</TableHead>
+              <TableHead className="font-bold">Source</TableHead>
               <TableHead className="font-bold">Status</TableHead>
               <TableHead className="text-right font-bold">Total</TableHead>
               <TableHead className="w-[50px]"></TableHead>
@@ -968,6 +1005,18 @@ export default function BookingsClient() {
                 </TableCell>
                 <TableCell>
                   {findUnitForBooking(booking.unitId)?.name || "N/A"}
+                </TableCell>
+                <TableCell>
+                  <span className="inline-flex items-center gap-2 text-sm font-medium text-gray-700">
+                    <span
+                      aria-hidden="true"
+                      className="h-2.5 w-2.5 rounded-full"
+                      style={{
+                        backgroundColor: getBookingSourceColor(booking),
+                      }}
+                    />
+                    {getBookingSourceDisplayName(booking)}
+                  </span>
                 </TableCell>
                 <TableCell>
                   <div className="flex flex-col gap-1">
@@ -1036,7 +1085,7 @@ export default function BookingsClient() {
         setDetailsBooking={setEditingBooking}
         agents={agents}
         units={units}
-        saving={formLoading}
+        saving={formLoading || imageSaving}
         onSave={() => handleSaveBooking()}
         onSaveSnapshot={handleSaveBookingImage}
         onCopyLetter={handleCopyAuthorizationLetter}

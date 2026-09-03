@@ -60,8 +60,10 @@ async function getAuthToken(auth?: Auth) {
   }
 
   try {
-    // Refresh token to prevent stale desktop sessions
-    const token = await user.getIdToken(true);
+    // Firebase refreshes expired tokens itself. Forcing a refresh for every
+    // CRUD request turns a normal save into an extra network round trip and
+    // causes visible UI stalls in the desktop app.
+    const token = await user.getIdToken();
     tokenCache.set(cacheKey, {
       token,
       expiresAt: Date.now() + TOKEN_CACHE_TTL_MS,

@@ -1,6 +1,7 @@
 export type AppRole = "admin" | "staff" | "viewer";
 
-const ADMIN_ONLY_PREFIXES = ["/settings/", "/analytics/"];
+const ADMIN_ONLY_PREFIXES = ["/settings/"];
+const STAFF_AND_ADMIN_PREFIXES = ["/analytics/"];
 
 export function normalizeRole(role: unknown): AppRole {
   const value = String(role || "")
@@ -25,6 +26,14 @@ export function canAccessPath(roleInput: unknown, pathname: string): boolean {
 
   if (ADMIN_ONLY_PREFIXES.some((prefix) => normalizedPath.startsWith(prefix))) {
     return false;
+  }
+
+  if (
+    STAFF_AND_ADMIN_PREFIXES.some((prefix) =>
+      normalizedPath.startsWith(prefix),
+    )
+  ) {
+    return role === "staff";
   }
 
   // Viewers can read operational pages. Mutation authorization is enforced

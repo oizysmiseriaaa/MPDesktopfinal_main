@@ -6,6 +6,7 @@ import React, {
   useMemo,
   useRef,
   useState,
+  useTransition,
 } from "react";
 import { useUser, useAuth } from "@/firebase";
 import { useAppResources } from "@/lib/app-data-store";
@@ -26,12 +27,15 @@ import {
   Building2,
   ChevronDown,
   CircleDot,
+  Circle,
+  CheckCircle2,
   Maximize2,
   Minimize2,
   ZoomIn,
   ZoomOut,
   RotateCcw,
-  MoreHorizontal,
+  TimerReset,
+  UserRound,
 } from "lucide-react";
 import { useDateStore } from "@/lib/date-store";
 import { useDialogCleanup } from "@/hooks/use-dialog-cleanup";
@@ -57,9 +61,9 @@ import { useToast } from "@/hooks/use-toast";
 import html2canvas from "html2canvas";
 import { AddBookingDialog } from "./add-booking-dialog";
 import { BookingDetailsDialog } from "./booking-details-dialog";
-import { CalendarBookingPanel } from "./calendar-booking-panel";
 import {
   getOperationsStatus,
+  formatOperationsDate,
   formatOperationsTime,
   formatTimeRemaining,
 } from "@/lib/calendar-operations";
@@ -71,7 +75,14 @@ import {
   deduplicateCalendarBookingsByDate,
   getCalendarBookingIdentity,
   getOccupiedCalendarDates,
+  normalizeCalendarDate,
 } from "@/lib/calendar-booking-occupancy";
+import { summarizeBookingBatchResults } from "@/lib/booking-batch";
+import {
+  BOOKING_SOURCE_LEGEND,
+  getBookingSourceLabel,
+  type BookingSourceLabel,
+} from "@/lib/booking-source";
 
 const unitColors = [
   "#2563EB",
@@ -94,14 +105,38 @@ const unitColors = [
   "#C2410C",
 ];
 
-function dataUrlToUint8Array(dataUrl: string) {
-  const base64 = dataUrl.split(",")[1] || "";
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
+const bookingLabelStyles = BOOKING_SOURCE_LEGEND;
+type BookingLabel = BookingSourceLabel;
+const getBookingLabel = getBookingSourceLabel;
+
+// Darken a hex color so unit-colored bars stay prominent with white text
+// while keeping the unit's identity color.
+const darkenHexColor = (hex: string, amount = 0.12) => {
+  const match = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(
+    String(hex || "").trim(),
+  );
+  if (!match) return hex;
+  const adjust = (channel: string) =>
+    Math.max(0, Math.min(255, Math.round(parseInt(channel, 16) * (1 - amount))))
+      .toString(16)
+      .padStart(2, "0");
+  return `#${adjust(match[1])}${adjust(match[2])}${adjust(match[3])}`;
+};
+
+function canvasToPngBytes(canvas: HTMLCanvasElement): Promise<Uint8Array> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(async (blob) => {
+      if (!blob) {
+        reject(new Error("Unable to encode the booking image."));
+        return;
+      }
+      try {
+        resolve(new Uint8Array(await blob.arrayBuffer()));
+      } catch (error) {
+        reject(error);
+      }
+    }, "image/png");
+  });
 }
 
 type CalendarCell = {
@@ -125,6 +160,8 @@ type BookingDraft = {
   guestEmail: string;
   agentId: string;
   agentName: string;
+  bookingSource: string;
+  bookingLabel: string;
   bookingDate: string;
   adults: number;
   children: number;
@@ -262,6 +299,30 @@ const isSameDay = (left: Date, right: Date) => {
 
 const todayDateInput = todayLocalDateInput;
 
+// One-time temporary block for the specific August 29 occurrence.
+// All units are blocked except the listed exceptions. This is visual/availability
+// only and never touches Firestore data, recurring availability, or other dates.
+const AUG29_BLOCK_DATE = "2026-08-29";
+const AUG29_BLOCK_EXCEPTIONS = ["shore 3", "447"];
+const isAug29ExceptionUnit = (unit: any) => {
+  // Match against every stable identity available on the unit, rather than its
+  // rendered row position (or a single preferred label).
+  return toComparableUnitValues(unit).some((value) =>
+    AUG29_BLOCK_EXCEPTIONS.includes(value),
+  );
+};
+const isAug29BlockedCell = (unit: any, dateStr: string) =>
+  dateStr === AUG29_BLOCK_DATE && !isAug29ExceptionUnit(unit);
+
+// One-time all-unit closure. Date-string comparisons are deliberate: calendar
+// dates are stored and selected as YYYY-MM-DD values, avoiding timezone drift.
+const WINTER_BLOCK_START_DATE = "2026-12-01";
+const WINTER_BLOCK_END_DATE = "2027-01-31";
+const isWinterClosureDate = (dateStr: string) =>
+  dateStr >= WINTER_BLOCK_START_DATE && dateStr <= WINTER_BLOCK_END_DATE;
+const isCalendarBlockedCell = (unit: any, dateStr: string) =>
+  isAug29BlockedCell(unit, dateStr) || isWinterClosureDate(dateStr);
+
 const toNumber = (value: any, fallback = 0) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -311,6 +372,8 @@ const makeDefaultBookingDraft = (): BookingDraft => {
     guestEmail: "",
     agentId: "",
     agentName: "",
+    bookingSource: "N/A",
+    bookingLabel: "N/A",
     bookingDate: today,
     adults: 2,
     children: 0,
@@ -356,7 +419,12 @@ export default function CalendarClient() {
   const { toast } = useToast();
   const { month, year, setMonth, setYear } = useDateStore();
 
-  const calendarResources = useAppResources(["bookings", "units", "agents", "expenses"]);
+  const calendarResources = useAppResources([
+    "bookings",
+    "units",
+    "agents",
+    "expenses",
+  ]);
   const remindersResources = useAppResources(["reminders"]);
   const bookings = calendarResources.data["bookings"] ?? [];
   const calendarBookings = useMemo(() => {
@@ -391,14 +459,23 @@ export default function CalendarClient() {
     useState<BookingDocumentType | null>(null);
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [imageSaving, setImageSaving] = useState(false);
   const [bookingDraft, setBookingDraft] = useState<BookingDraft>(() =>
     makeDefaultBookingDraft(),
   );
+  const [, startDraftTransition] = useTransition();
   const [unitFilter, setUnitFilter] = useState<string>("all");
   const [isDesktopHover, setIsDesktopHover] = useState(false);
   const [isFullScreen, setIsFullScreen] = useState(false);
   const [isUnitLegendOpen, setIsUnitLegendOpen] = useState(false);
   const [calendarZoom, setCalendarZoom] = useState(1);
+  const [isOffGrid, setIsOffGrid] = useState(false);
+  const [isInquiryMode, setIsInquiryMode] = useState(false);
+  const [inquiryStartDate, setInquiryStartDate] = useState<string | null>(null);
+  const [inquiryEndDate, setInquiryEndDate] = useState<string | null>(null);
+  const [inquirySearchRan, setInquirySearchRan] = useState(false);
+  const [inquiryBookingRange, setInquiryBookingRange] =
+    useState<UnitDateRange | null>(null);
   const [viewportWidth, setViewportWidth] = useState(() =>
     typeof window === "undefined" ? 1440 : window.innerWidth,
   );
@@ -505,6 +582,13 @@ export default function CalendarClient() {
     setDragAnchor(null);
     setDragTarget(null);
     setDragAction("add");
+    setInquiryBookingRange(null);
+  }, []);
+
+  const clearInquiryRange = useCallback(() => {
+    setInquiryStartDate(null);
+    setInquiryEndDate(null);
+    setInquirySearchRan(false);
   }, []);
 
   const handleUnitFilter = useCallback(
@@ -542,7 +626,7 @@ export default function CalendarClient() {
     const now = new Date();
     setMonth(now.getMonth());
     setYear(now.getFullYear());
-    clearSelection();
+    if (!isInquiryMode) clearSelection();
 
     requestAnimationFrame(() => {
       const target = document.querySelector(
@@ -556,9 +640,9 @@ export default function CalendarClient() {
         });
       }
     });
-  }, [clearSelection, setMonth, setYear]);
+  }, [clearSelection, isInquiryMode, setMonth, setYear]);
 
-  useDialogCleanup(isAddDialogOpen || !!detailsBooking || !!operationsBooking);
+  useDialogCleanup(isAddDialogOpen || !!detailsBooking);
 
   const calendarSnapshotRef = useRef<HTMLDivElement | null>(null);
   const detailsSnapshotRef = useRef<HTMLDivElement | null>(null);
@@ -581,11 +665,21 @@ export default function CalendarClient() {
           Math.floor((viewportWidth - 160) / Math.max(daysInMonth.length, 1)),
         ),
       )
-    : 144;
+    : 64;
   const computedDayWidth = Math.round(baseDayWidth * zoomScale);
-  const computedCellHeight = Math.max(56, Math.round(56 * zoomScale));
-  const computedHeaderHeight = Math.max(56, Math.round(56 * zoomScale));
-  const computedUnitRowHeight = Math.max(56, Math.round(56 * zoomScale));
+  const compactBase = 40;
+  const computedCellHeight = Math.max(
+    compactBase,
+    Math.round(compactBase * zoomScale),
+  );
+  const computedHeaderHeight = Math.max(
+    compactBase,
+    Math.round(compactBase * zoomScale),
+  );
+  const computedUnitRowHeight = Math.max(
+    compactBase,
+    Math.round(compactBase * zoomScale),
+  );
   const fullScreenCardPadding = zoomScale < 0.85 ? 8 : 10;
   const fullScreenFontSize = zoomScale < 0.85 ? 10 : 11;
   const fullScreenCompactTextSize = zoomScale < 0.85 ? 8 : 9;
@@ -627,8 +721,11 @@ export default function CalendarClient() {
     return calendarBookingByCell.get(`${unitId}__${date}`) || null;
   };
 
-  const isCellAvailable = (unit: any, dateObj: Date) =>
-    !findBookingForCell(unit, dateObj);
+  const isCellAvailable = (unit: any, dateObj: Date) => {
+    if (isCalendarBlockedCell(unit, format(dateObj, "yyyy-MM-dd")))
+      return false;
+    return !findBookingForCell(unit, dateObj);
+  };
 
   const buildCellsBetween = (start: CalendarCell, end: CalendarCell) => {
     const minUnitIndex = Math.min(start.unitIndex, end.unitIndex);
@@ -672,6 +769,29 @@ export default function CalendarClient() {
   const selectedCellKeys = useMemo(
     () => new Set(selection.map(cellKey)),
     [selection],
+  );
+
+  const inquiryRangeDates = useMemo(() => {
+    if (!inquiryStartDate) return [];
+    const start = new Date(`${inquiryStartDate}T00:00:00`);
+    const end = new Date(`${inquiryEndDate || inquiryStartDate}T00:00:00`);
+    if (
+      Number.isNaN(start.getTime()) ||
+      Number.isNaN(end.getTime()) ||
+      end < start
+    )
+      return [];
+    // Checkout is not an occupied night. A 29 Aug → 2 Sep inquiry is four
+    // nights (29–31 Aug and 1 Sep), while the checkout date stays visible in
+    // the picker and is never treated as a booking conflict.
+    const lastNight = inquiryEndDate ? addDays(end, -1) : start;
+    return eachDayOfInterval({ start, end: lastNight }).map((day) =>
+      format(day, "yyyy-MM-dd"),
+    );
+  }, [inquiryStartDate, inquiryEndDate]);
+  const inquiryRangeDateSet = useMemo(
+    () => new Set(inquiryRangeDates),
+    [inquiryRangeDates],
   );
   const dragCellKeys = useMemo(
     () => new Set(dragSelection.map(cellKey)),
@@ -750,8 +870,10 @@ export default function CalendarClient() {
   );
 
   const selectedRanges = useMemo<UnitDateRange[]>(() => {
-    return buildSelectedRanges(selection);
-  }, [buildSelectedRanges, selection]);
+    return inquiryBookingRange
+      ? [inquiryBookingRange]
+      : buildSelectedRanges(selection);
+  }, [buildSelectedRanges, inquiryBookingRange, selection]);
 
   const getAgentLabel = (agent: any) =>
     agent?.name || agent?.fullName || agent?.agentName || "Unnamed Agent";
@@ -783,6 +905,48 @@ export default function CalendarClient() {
       ),
     [calendarBookings, units],
   );
+
+  // Inquiry mode: reuse existing availability/occupancy logic to summarize which
+  // units are available vs occupied for the selected date range. No bookings are
+  // created and no records are modified.
+  const inquiryResults = useMemo(() => {
+    if (!inquirySearchRan || inquiryRangeDates.length === 0) return null;
+    const byUnit = new Map<
+      string,
+      { unit: any; total: number; booked: number; blocked: number }
+    >();
+    for (const unit of displayUnits) {
+      const unitId = String(unit.id);
+      const entry = {
+        unit,
+        total: inquiryRangeDates.length,
+        booked: 0,
+        blocked: 0,
+      };
+      for (const date of inquiryRangeDates) {
+        if (isCalendarBlockedCell(unit, date)) entry.blocked += 1;
+        else if (calendarBookingByCell.has(`${unitId}__${date}`))
+          entry.booked += 1;
+      }
+      byUnit.set(unitId, entry);
+    }
+    const rows = Array.from(byUnit.values()).map((entry) => ({
+      unit: entry.unit,
+      total: entry.total,
+      booked: entry.booked,
+      blocked: entry.blocked,
+      available: entry.booked === 0 && entry.blocked === 0,
+    }));
+    const availableCount = rows.filter((row) => row.available).length;
+    const occupiedCount = rows.filter((row) => row.booked > 0).length;
+    const blockedCount = rows.filter((row) => row.blocked > 0).length;
+    return { rows, availableCount, occupiedCount, blockedCount };
+  }, [
+    inquirySearchRan,
+    inquiryRangeDates,
+    displayUnits,
+    calendarBookingByCell,
+  ]);
 
   const getBookingGuestName = (booking: any) => {
     const explicitGuestName = String(booking?.guestName || "").trim();
@@ -872,15 +1036,17 @@ export default function CalendarClient() {
   };
 
   const setDraftNested = (path: string, value: any) => {
-    setBookingDraft((prev: any) => {
-      const [parent, child] = path.split(".");
-      return {
-        ...prev,
-        [parent]: {
-          ...(prev[parent] || {}),
-          [child]: value,
-        },
-      };
+    startDraftTransition(() => {
+      setBookingDraft((prev: any) => {
+        const [parent, child] = path.split(".");
+        return {
+          ...prev,
+          [parent]: {
+            ...(prev[parent] || {}),
+            [child]: value,
+          },
+        };
+      });
     });
   };
 
@@ -1001,7 +1167,8 @@ export default function CalendarClient() {
     // Auto-create housekeeping reminders when checkout is within 5 minutes
     if (!user) return;
     const now = Date.now();
-    if (now - lastHousekeepingCheckRef.current < HOUSEKEEPING_CHECK_INTERVAL_MS) return;
+    if (now - lastHousekeepingCheckRef.current < HOUSEKEEPING_CHECK_INTERVAL_MS)
+      return;
     lastHousekeepingCheckRef.current = now;
     (async () => {
       for (const booking of calendarBookings as any[]) {
@@ -1078,104 +1245,129 @@ export default function CalendarClient() {
     });
   };
 
-  const buildBookingImageBaseName = (booking: any) => {
-    const bookingDate =
-      toDateInput(getBookingDateValue(booking)) || todayDateInput();
-    const yyyymmdd = bookingDate.replace(/-/g, "");
-    const sanitizePathSegment = (
-      value: string | undefined,
-      fallback: string,
-    ) => {
-      return (value || fallback)
-        .replace(/[\\/:*?"<>|]+/g, "_")
-        .replace(/\s+/g, "-");
-    };
-    const unitName = sanitizePathSegment(getBookingUnitName(booking), "Unit");
-    const identifier = sanitizePathSegment(
-      booking?.id ||
-        booking?.bookingReference ||
-        `${booking?.guestFirstName || "booking"}-${booking?.guestLastName || ""}`,
-      "booking",
-    );
-    return `${yyyymmdd}_${unitName}_${identifier}`;
-  };
+  const getBookingBarsForUnit = useCallback(
+    (unit: any, offGrid: boolean) => {
+      const unitId = String(unit?.id || "");
+      const segments = new Map<string, { booking: any; dates: string[] }>();
+      const monthStart = startOfMonth(viewDate);
+      const monthEnd = endOfMonth(viewDate);
 
-  const buildBookingImageRelativePath = (booking: any) =>
-    `ManilaPrime/Bookings/${buildBookingImageBaseName(booking)}.png`;
+      for (const booking of calendarBookings as any[]) {
+        const ownedDates = getOccupiedCalendarDates(booking).filter(
+          (date) => calendarBookingByCell.get(`${unitId}__${date}`) === booking,
+        );
+        if (ownedDates.length === 0) continue;
 
-  const getBookingBarsForUnit = (unit: any) => {
-    const unitId = String(unit?.id || "");
-    const segments = new Map<string, { booking: any; dates: string[] }>();
-    const monthStart = startOfMonth(viewDate);
-    const monthEnd = endOfMonth(viewDate);
-
-    for (const booking of calendarBookings as any[]) {
-      const ownedDates = getOccupiedCalendarDates(booking).filter(
-        (date) => calendarBookingByCell.get(`${unitId}__${date}`) === booking,
-      );
-      if (ownedDates.length === 0) continue;
-
-      const identity = getCalendarBookingIdentity(booking);
-      const existing = segments.get(identity);
-      if (existing) {
-        existing.dates.push(...ownedDates);
-      } else {
-        segments.set(identity, { booking, dates: ownedDates });
-      }
-    }
-
-    return Array.from(segments.values()).flatMap(({ booking, dates }) => {
-      const sortedDates = dates.sort();
-      const ranges: string[][] = [];
-      for (const date of sortedDates) {
-        const current = ranges[ranges.length - 1];
-        const previous = current?.[current.length - 1];
-        const nextDate = previous
-          ? format(addDays(new Date(`${previous}T00:00:00`), 1), "yyyy-MM-dd")
-          : "";
-        if (current && nextDate === date) current.push(date);
-        else ranges.push([date]);
+        const identity = getCalendarBookingIdentity(booking);
+        const existing = segments.get(identity);
+        if (existing) {
+          existing.dates.push(...ownedDates);
+        } else {
+          segments.set(identity, { booking, dates: ownedDates });
+        }
       }
 
-      return ranges.flatMap((range) => {
-        const rawStart = new Date(`${range[0]}T00:00:00`);
-        const rawEnd = new Date(`${range[range.length - 1]}T00:00:00`);
+      return Array.from(segments.values()).flatMap(({ booking, dates }) => {
+        const sortedDates = dates.sort();
+        const ranges: string[][] = [];
+        for (const date of sortedDates) {
+          const current = ranges[ranges.length - 1];
+          const previous = current?.[current.length - 1];
+          const nextDate = previous
+            ? format(addDays(new Date(`${previous}T00:00:00`), 1), "yyyy-MM-dd")
+            : "";
+          if (current && nextDate === date) current.push(date);
+          else ranges.push([date]);
+        }
 
-        // Skip ranges that are entirely outside the visible month.
-        if (rawEnd.getTime() < monthStart.getTime()) return [];
-        if (rawStart.getTime() > monthEnd.getTime()) return [];
+        return ranges.flatMap((range) => {
+          const rawStart = new Date(`${range[0]}T00:00:00`);
+          const rawEnd = new Date(`${range[range.length - 1]}T00:00:00`);
 
-        // Clip ranges that extend before/after the visible month so
-        // multi-month (long-term) bookings still render on-screen.
-        const clippedStart = rawStart.getTime() < monthStart.getTime();
-        const clippedEnd = rawEnd.getTime() > monthEnd.getTime();
-        const visibleStart = clippedStart ? monthStart : rawStart;
-        const visibleEnd = clippedEnd ? monthEnd : rawEnd;
+          // Skip ranges that are entirely outside the visible month.
+          if (rawEnd.getTime() < monthStart.getTime()) return [];
+          if (rawStart.getTime() > monthEnd.getTime()) return [];
 
-        const startIndex = daysInMonth.findIndex((day) =>
-          isSameDay(day, visibleStart),
-        );
-        const endIndex = daysInMonth.findIndex((day) =>
-          isSameDay(day, visibleEnd),
-        );
-        if (startIndex < 0 || endIndex < startIndex) return [];
-        return [
-          {
-            booking,
-            startIndex,
-            endIndex,
-            span: endIndex - startIndex + 1,
-            paymentStatus: getPaymentStatus(booking),
-            pillStatus: getPillStatus(booking),
-            clippedStart,
-            clippedEnd,
-            lane: 0,
-            laneCount: 1,
-          },
-        ];
+          // Clip ranges that extend before/after the visible month so
+          // multi-month (long-term) bookings still render on-screen.
+          const clippedStart = rawStart.getTime() < monthStart.getTime();
+          const clippedEnd = rawEnd.getTime() > monthEnd.getTime();
+          const visibleStart = clippedStart ? monthStart : rawStart;
+          const visibleEnd = clippedEnd ? monthEnd : rawEnd;
+
+          const startIndex = daysInMonth.findIndex((day) =>
+            isSameDay(day, visibleStart),
+          );
+          const endIndex = daysInMonth.findIndex((day) =>
+            isSameDay(day, visibleEnd),
+          );
+          if (startIndex < 0 || endIndex < startIndex) return [];
+
+          // Off Grid: derive a continuous, fractional position from the real
+          // check-in / check-out dates so the bar is not forced to snap to the
+          // date-grid cell boundaries. This is purely visual.
+          let fracStart = startIndex;
+          let fracWidth = endIndex - startIndex + 1;
+          if (offGrid) {
+            const checkinDate = normalizeCalendarDate(
+              booking?.checkinDate || booking?.checkIn,
+            );
+            const checkoutDate = normalizeCalendarDate(
+              booking?.checkoutDate || booking?.checkOut,
+            );
+            if (checkinDate && checkoutDate) {
+              const cIn = new Date(`${checkinDate}T00:00:00`).getTime();
+              const cOut = new Date(`${checkoutDate}T00:00:00`).getTime();
+              const day = 86400000;
+              const rawStartFrac = Math.round(
+                (cIn - monthStart.getTime()) / day,
+              );
+              const rawEndFrac = Math.round(
+                (cOut - monthStart.getTime()) / day,
+              );
+              const startFrac = Math.max(
+                0,
+                Math.min(rawStartFrac, daysInMonth.length),
+              );
+              const endFrac = Math.max(
+                0,
+                Math.min(rawEndFrac, daysInMonth.length),
+              );
+              fracStart = startFrac;
+              fracWidth = Math.max(0, endFrac - startFrac);
+            }
+          }
+
+          return [
+            {
+              booking,
+              startIndex,
+              endIndex,
+              span: endIndex - startIndex + 1,
+              fracStart,
+              fracWidth,
+              paymentStatus: getPaymentStatus(booking),
+              pillStatus: getPillStatus(booking),
+              bookingLabel: getBookingLabel(booking),
+              clippedStart,
+              clippedEnd,
+              lane: 0,
+              laneCount: 1,
+            },
+          ];
+        });
       });
-    });
-  };
+    },
+    [viewDate, daysInMonth, calendarBookingByCell, calendarBookings, systemNow],
+  );
+
+  const bookingBarsByUnit = useMemo(() => {
+    const map = new Map<string, any[]>();
+    for (const unit of displayUnits) {
+      map.set(String(unit.id), getBookingBarsForUnit(unit, isOffGrid));
+    }
+    return map;
+  }, [displayUnits, getBookingBarsForUnit, isOffGrid]);
 
   const handleCopyCalendarAuthorizationLetters = async () => {
     if (selectedRanges.length === 0) {
@@ -1215,13 +1407,17 @@ export default function CalendarClient() {
       return;
     }
 
+    setImageSaving(true);
     try {
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame(() => resolve()),
+      );
       const canvas = await html2canvas(calendarSnapshotRef.current, {
         backgroundColor: "#141414",
-        scale: 2,
+        scale: 1,
+        logging: false,
       });
-      const dataUrl = canvas.toDataURL("image/png");
-      const pngBytes = dataUrlToUint8Array(dataUrl);
+      const pngBytes = await canvasToPngBytes(canvas);
 
       const { exists, mkdir, writeFile, BaseDirectory } =
         await import("@tauri-apps/plugin-fs");
@@ -1238,21 +1434,34 @@ export default function CalendarClient() {
       const folder = "ManilaPrime/Bookings";
       const targetPath = `${folder}/${fileName}`;
 
-      await mkdir(folder, { baseDir: BaseDirectory.Document, recursive: true });
-      if (await exists(targetPath, { baseDir: BaseDirectory.Document })) {
+      await mkdir(folder, {
+        baseDir: BaseDirectory.Desktop,
+        recursive: true,
+      });
+      if (await exists(targetPath, { baseDir: BaseDirectory.Desktop })) {
         const shouldReplace = window.confirm(
           `${fileName} already exists. Replace it?`,
         );
         if (!shouldReplace) return;
       }
-
       await writeFile(targetPath, pngBytes, {
-        baseDir: BaseDirectory.Document,
+        baseDir: BaseDirectory.Desktop,
+        create: true,
       });
-
-      toast({ title: "Booking image saved" });
+      toast({
+        title: "Booking image saved",
+        description: `Saved to Desktop/${targetPath}`,
+      });
     } catch (error: any) {
-      toast({ variant: "destructive", title: "Image save failed" });
+      console.error("Booking image save failed", error);
+      toast({
+        variant: "destructive",
+        title: "Image save failed",
+        description:
+          error?.message || "The booking image could not be created.",
+      });
+    } finally {
+      setImageSaving(false);
     }
   };
 
@@ -1267,86 +1476,38 @@ export default function CalendarClient() {
         unit,
         preparedBy: user?.displayName || user?.email || null,
       });
-      const { exists, mkdir, writeFile, open, BaseDirectory } =
+      const { exists, mkdir, writeFile, BaseDirectory } =
         await import("@tauri-apps/plugin-fs");
       const folder =
-        type === "quotation"
-          ? "HostFlow/Quotations"
-          : "HostFlow/Statements of Account";
+        type === "quotation" ? "ManilaPrime/Quotations" : "ManilaPrime/SOA";
       const path = `${folder}/${document.fileName}`;
-      const desktopFolder = "ManilaPrime/HostFlow";
-      const desktopPath = `${desktopFolder}/${document.fileName}`;
 
       if (!document?.bytes || document.bytes.length === 0) {
         throw new Error("Generated PDF bytes are empty");
       }
 
-      try {
-        await mkdir(folder, {
-          baseDir: BaseDirectory.Document,
-          recursive: true,
-        });
-        if (
-          (await exists(path, { baseDir: BaseDirectory.Document })) &&
-          !confirm(`${document.fileName} already exists. Replace it?`)
-        )
-          return;
+      await mkdir(folder, {
+        baseDir: BaseDirectory.Desktop,
+        recursive: true,
+      });
+      if (
+        (await exists(path, { baseDir: BaseDirectory.Desktop })) &&
+        !confirm(`${document.fileName} already exists. Replace it?`)
+      )
+        return;
 
-        await writeFile(path, document.bytes, {
-          baseDir: BaseDirectory.Document,
-          create: true,
-        });
+      await writeFile(path, document.bytes, {
+        baseDir: BaseDirectory.Desktop,
+        create: true,
+      });
 
-        toast({
-          title:
-            type === "quotation"
-              ? "Quotation generated"
-              : "Statement of Account generated",
-          description: `Saved to Documents/${path}`,
-        });
-      } catch (documentSaveError) {
-        console.warn(
-          "Document save failed, falling back to Desktop",
-          documentSaveError,
-        );
-        try {
-          await mkdir(desktopFolder, {
-            baseDir: BaseDirectory.Desktop,
-            recursive: true,
-          });
-          await writeFile(desktopPath, document.bytes, {
-            baseDir: BaseDirectory.Desktop,
-            create: true,
-          });
-          toast({
-            title:
-              type === "quotation"
-                ? "Quotation generated"
-                : "Statement of Account generated",
-            description: `Saved to Desktop/${desktopPath}`,
-          });
-        } catch (desktopSaveError) {
-          console.error(
-            "Desktop fallback save failed, retrying with open/write",
-            desktopSaveError,
-          );
-          const file = await open(desktopPath, {
-            write: true,
-            create: true,
-            truncate: true,
-            baseDir: BaseDirectory.Desktop,
-          });
-          await file.write(document.bytes);
-          await file.close();
-          toast({
-            title:
-              type === "quotation"
-                ? "Quotation generated"
-                : "Statement of Account generated",
-            description: `Saved to Desktop/${desktopPath}`,
-          });
-        }
-      }
+      toast({
+        title:
+          type === "quotation"
+            ? "Quotation generated"
+            : "Statement of Account generated",
+        description: `Saved to Desktop/${path}`,
+      });
     } catch (error: any) {
       const errorMessage =
         error instanceof Error
@@ -1442,18 +1603,144 @@ export default function CalendarClient() {
     const prev = subMonths(viewDate, 1);
     setMonth(prev.getMonth());
     setYear(prev.getFullYear());
-    clearSelection();
-  }, [clearSelection, setMonth, setYear, viewDate]);
+    if (!isInquiryMode) clearSelection();
+  }, [clearSelection, isInquiryMode, setMonth, setYear, viewDate]);
 
   const handleNextMonth = useCallback(() => {
     const next = addMonths(viewDate, 1);
     setMonth(next.getMonth());
     setYear(next.getFullYear());
+    if (!isInquiryMode) clearSelection();
+  }, [clearSelection, isInquiryMode, setMonth, setYear, viewDate]);
+
+  const handleInquiryDateSelect = useCallback(
+    (date: string) => {
+      setOperationsBooking(null);
+      setDetailsBooking(null);
+      setSelection([]);
+      setDragSelection([]);
+      setDragAnchor(null);
+      setDragTarget(null);
+      setInquirySearchRan(false);
+
+      if (!inquiryStartDate || inquiryEndDate) {
+        setInquiryStartDate(date);
+        setInquiryEndDate(null);
+        return;
+      }
+
+      // Starting a new range on an earlier date avoids ever storing an invalid
+      // end-before-start state, while still making correction a one-click action.
+      if (date < inquiryStartDate) {
+        setInquiryStartDate(date);
+        setInquiryEndDate(null);
+        return;
+      }
+      setInquiryEndDate(date);
+    },
+    [inquiryEndDate, inquiryStartDate],
+  );
+
+  const updateInquiryDate = useCallback(
+    (field: "start" | "end", date: string) => {
+      if (!date) return;
+      setInquirySearchRan(false);
+      if (field === "start") {
+        setInquiryStartDate(date);
+        // Keep a valid range while editing: checkout follows check-in only
+        // when it would otherwise be before it.
+        if (!inquiryEndDate || inquiryEndDate < date) {
+          setInquiryEndDate(
+            format(addDays(new Date(`${date}T00:00:00`), 1), "yyyy-MM-dd"),
+          );
+        }
+      } else if (!inquiryStartDate || date >= inquiryStartDate) {
+        setInquiryEndDate(date);
+      }
+    },
+    [inquiryEndDate, inquiryStartDate],
+  );
+
+  const setInquiryQuickRange = useCallback(
+    (offset: number) => {
+      const start = addDays(new Date(), offset);
+      const end = addDays(start, 1);
+      setInquiryStartDate(format(start, "yyyy-MM-dd"));
+      setInquiryEndDate(format(end, "yyyy-MM-dd"));
+      setInquirySearchRan(false);
+      if (!isInquiryMode) setIsInquiryMode(true);
+    },
+    [isInquiryMode],
+  );
+
+  const checkInquiryAvailability = useCallback(() => {
+    if (!inquiryStartDate || !inquiryEndDate) {
+      toast({
+        variant: "destructive",
+        title: "Choose check-in and check-out dates",
+      });
+      return;
+    }
+    if (inquiryEndDate <= inquiryStartDate) {
+      toast({
+        variant: "destructive",
+        title: "Check-out must be after check-in",
+      });
+      return;
+    }
+    if (!isInquiryMode) setIsInquiryMode(true);
+    setInquirySearchRan(true);
+  }, [inquiryEndDate, inquiryStartDate, isInquiryMode, toast]);
+
+  const startInquiryBooking = useCallback(
+    (unit: any) => {
+      if (!inquiryStartDate || !inquiryEndDate) return;
+      const start = new Date(`${inquiryStartDate}T00:00:00`);
+      const end = new Date(`${inquiryEndDate}T00:00:00`);
+      const range: UnitDateRange = {
+        unit,
+        checkinDate: inquiryStartDate,
+        checkoutDate: inquiryEndDate,
+        nights: Math.max(
+          1,
+          Math.round((end.getTime() - start.getTime()) / 86400000),
+        ),
+      };
+      setInquiryBookingRange(range);
+      setBookingDraft(
+        (draft) =>
+          ({
+            ...draft,
+            checkinDate: range.checkinDate,
+            checkoutDate: range.checkoutDate,
+          }) as any,
+      );
+      setIsAddDialogOpen(true);
+    },
+    [inquiryEndDate, inquiryStartDate],
+  );
+
+  const toggleInquiryMode = useCallback(() => {
+    // Do not perform other state updates inside a state-setter callback. In
+    // React strict mode that callback may be replayed, which previously left
+    // the calendar with a stale drag or inquiry selection.
+    setIsInquiryMode(!isInquiryMode);
     clearSelection();
-  }, [clearSelection, setMonth, setYear, viewDate]);
+    clearInquiryRange();
+  }, [clearInquiryRange, clearSelection, isInquiryMode]);
+
+  const toggleOffGrid = useCallback(() => {
+    // Off Grid changes timeline positioning only; it intentionally preserves
+    // the visible month, inquiry range, and any normal booking selection.
+    setIsOffGrid((enabled) => !enabled);
+  }, []);
 
   const handleAvailableMouseDown = useCallback(
     (cell: CalendarCell) => {
+      const blockUnit = displayUnits.find(
+        (unit) => String(unit.id) === cell.unitId,
+      );
+      if (blockUnit && isCalendarBlockedCell(blockUnit, cell.date)) return;
       const { availableCells, blockedCells } = buildCellsBetween(cell, cell);
       const isAlreadySelected = selectedCellKeys.has(cellKey(cell));
       setDragAction(isAlreadySelected ? "remove" : "add");
@@ -1474,12 +1761,19 @@ export default function CalendarClient() {
       setOperationsBooking(null);
       setDetailsBooking(null);
     },
-    [areCellsEqual, selectedCellKeys],
+    [areCellsEqual, buildCellsBetween, displayUnits, selectedCellKeys],
   );
 
-  const updateDraft = useCallback((field: keyof BookingDraft, value: any) => {
-    setBookingDraft((prev) => ({ ...prev, [field]: value }));
-  }, []);
+  const updateDraft = useCallback(
+    (field: keyof BookingDraft, value: any) => {
+      // Calendar rows contain hundreds of interactive cells. Keeping draft edits
+      // non-urgent prevents those cells from blocking text entry in the dialog.
+      startDraftTransition(() => {
+        setBookingDraft((prev) => ({ ...prev, [field]: value }));
+      });
+    },
+    [startDraftTransition],
+  );
 
   const handleToggleSelection = useCallback(
     (cell: CalendarCell) => {
@@ -1541,33 +1835,38 @@ export default function CalendarClient() {
     );
     if (existing) return;
     try {
-      await apiClient.post(
-        "/expense",
-        {
-          id: commissionId,
-          uid: user?.uid,
-          title: `Commission - ${bookingData.agentName} - ${guestName}`,
-          category: "Agent Commission",
-          agentId: bookingData.agentId,
-          agentName: bookingData.agentName,
-          bookingId: bookingData.bookingId,
-          amount: Math.round(commissionAmount * 100) / 100,
-          date: bookingData.checkinDate,
-          commissionStatus: "on hold",
-          unitId: bookingData.unitId,
-          unitName: bookingData.unitName,
-          paymentMethod: "CASH",
-          notes: `Auto-generated commission for ${guestName} (${nights} nights)`,
-          createdAt: new Date().toISOString(),
-        },
-        auth,
-      );
+      const payload = removeUndefinedDeep({
+        id: commissionId,
+        uid: user?.uid,
+        title: `Commission - ${bookingData.agentName} - ${guestName}`,
+        category: "Agent Commission",
+        agentId: bookingData.agentId,
+        agentName: bookingData.agentName,
+        bookingId: bookingData.bookingId,
+        amount: Math.round(commissionAmount * 100) / 100,
+        date: bookingData.checkinDate,
+        commissionStatus: "on hold",
+        unitId: bookingData.unitId,
+        unitName: bookingData.unitName,
+        paymentMethod: "CASH",
+        notes: `Auto-generated commission for ${guestName} (${nights} nights)`,
+        createdAt: new Date().toISOString(),
+      });
+      await apiClient.post("/expense", payload, auth);
     } catch (err) {
       console.error("Failed to create agent commission:", err);
+      toast({
+        variant: "destructive",
+        title: "Warning",
+        description: `Booking saved but agent commission creation failed. Please create the commission manually.`,
+      });
     }
   };
 
-  const handleSaveSelection = async (event: React.FormEvent) => {
+  const handleSaveSelection = async (
+    event: React.FormEvent,
+    submittedDraft: BookingDraft = bookingDraft,
+  ) => {
     if (!canManageOperations(role)) return;
     event.preventDefault();
     if (selectedRanges.length === 0) {
@@ -1587,8 +1886,30 @@ export default function CalendarClient() {
       clearSelection();
       return;
     }
+    // Inquiry results can become stale. Recheck the exact proposed range,
+    // including date-specific blocks, before any write is attempted.
+    for (const range of selectedRanges) {
+      const dates = eachDayOfInterval({
+        start: new Date(`${range.checkinDate}T00:00:00`),
+        end: addDays(new Date(`${range.checkoutDate}T00:00:00`), -1),
+      });
+      const unavailable = dates.some(
+        (day) => !isCellAvailable(range.unit, day),
+      );
+      if (unavailable) {
+        toast({
+          variant: "destructive",
+          title: "Booking conflict",
+          description:
+            "This unit is no longer available for the requested dates.",
+        });
+        setInquiryBookingRange(null);
+        return;
+      }
+    }
     const hasGuestName =
-      bookingDraft.guestFirstName.trim() || bookingDraft.guestLastName.trim();
+      submittedDraft.guestFirstName.trim() ||
+      submittedDraft.guestLastName.trim();
     if (!hasGuestName) {
       toast({ variant: "destructive", title: "Guest name required" });
       return;
@@ -1596,68 +1917,118 @@ export default function CalendarClient() {
     setSaving(true);
     try {
       const today = todayDateInput();
-      const bookingDate = toDateInput(bookingDraft.bookingDate) || today;
+      const bookingDate = toDateInput(submittedDraft.bookingDate) || today;
       const paymentStatus =
-        bookingDraft.bookingPaymentStatus ||
-        bookingDraft.paymentStatus ||
+        submittedDraft.bookingPaymentStatus ||
+        submittedDraft.paymentStatus ||
         "Unpaid";
-      const depositStatus = bookingDraft.securityDepositStatus || "Unpaid";
-      for (const range of selectedRanges) {
-        const totalAmount = bookingDraft.isCustomAmount
-          ? toNumber(bookingDraft.totalAmount, 0)
-          : getRangeAutoAmount(range, bookingDraft);
-        const payload = {
-          uid: user?.uid,
-          unitId: String(range.unit.id),
-          unitName: getUnitLabel(range.unit),
-          guestFirstName: bookingDraft.guestFirstName.trim(),
-          guestLastName: bookingDraft.guestLastName.trim(),
-          guestPhone: bookingDraft.guestPhone.trim(),
-          guestEmail: bookingDraft.guestEmail.trim(),
-          agentId: bookingDraft.agentId || "",
-          agentName: bookingDraft.agentName || "",
-          checkinDate: range.checkinDate,
-          checkoutDate: range.checkoutDate,
-          bookingDate,
-          adults: Number(bookingDraft.adults || 0),
-          children: Number(bookingDraft.children || 0),
-          paymentStatus,
-          bookingPaymentStatus: paymentStatus,
-          notes: bookingDraft.notes.trim(),
-          specialRequests: bookingDraft.notes.trim(),
-          totalAmount,
-          isCustomAmount: true,
-          securityDepositStatus: depositStatus,
-          securityDeposit: {
-            ...(bookingDraft.securityDeposit || {}),
-            status: depositStatus,
-          },
-          bookingPayment: {
-            ...(bookingDraft.bookingPayment || {}),
-            status: paymentStatus,
-          },
-          securityDepositReceipt: {
-            ...(bookingDraft.securityDepositReceipt || {}),
-            status: depositStatus,
-          },
-        };
-        const bookingRes = await apiClient.post<any>("/booking", payload, auth);
-        if (bookingDraft.agentId) {
-          await createAgentCommission({
-            agentId: bookingDraft.agentId,
-            agentName: bookingDraft.agentName,
-            totalAmount,
+      const depositStatus = submittedDraft.securityDepositStatus || "Unpaid";
+      const batchResults = await Promise.allSettled(
+        selectedRanges.map(async (range) => {
+          const totalAmount = submittedDraft.isCustomAmount
+            ? toNumber(submittedDraft.totalAmount, 0)
+            : getRangeAutoAmount(range, submittedDraft);
+          const payload = {
+            uid: user?.uid,
             unitId: String(range.unit.id),
             unitName: getUnitLabel(range.unit),
+            guestFirstName: submittedDraft.guestFirstName.trim(),
+            guestLastName: submittedDraft.guestLastName.trim(),
+            guestPhone: submittedDraft.guestPhone.trim(),
+            guestEmail: submittedDraft.guestEmail.trim(),
+            agentId: submittedDraft.agentId || "",
+            agentName: submittedDraft.agentName || "",
+            bookingSource: submittedDraft.bookingSource || "N/A",
+            bookingLabel: getBookingSourceLabel(
+              submittedDraft.bookingSource || "N/A",
+            ),
             checkinDate: range.checkinDate,
             checkoutDate: range.checkoutDate,
-            guestFirstName: bookingDraft.guestFirstName.trim(),
-            guestLastName: bookingDraft.guestLastName.trim(),
+            bookingDate,
+            adults: Number(submittedDraft.adults || 0),
+            children: Number(submittedDraft.children || 0),
+            paymentStatus,
+            bookingPaymentStatus: paymentStatus,
+            notes: submittedDraft.notes.trim(),
+            specialRequests: submittedDraft.notes.trim(),
+            totalAmount,
+            isCustomAmount: true,
+            securityDepositStatus: depositStatus,
+            securityDeposit: {
+              ...(submittedDraft.securityDeposit || {}),
+              status: depositStatus,
+            },
+            bookingPayment: {
+              ...(submittedDraft.bookingPayment || {}),
+              status: paymentStatus,
+            },
+            securityDepositReceipt: {
+              ...(submittedDraft.securityDepositReceipt || {}),
+              status: depositStatus,
+            },
+          };
+          const bookingRes = await apiClient.post<any>(
+            "/booking",
+            payload,
+            auth,
+          );
+          return {
+            range,
+            totalAmount,
             bookingId: bookingRes?.id || bookingRes?.data?.id || "",
-          });
-        }
+          };
+        }),
+      );
+
+      const { successful: createdBookings, failed: failedBookings } =
+        summarizeBookingBatchResults(batchResults);
+
+      if (createdBookings.length === 0) {
+        const firstFailure =
+          failedBookings[0]?.error || "Unknown booking error";
+        throw new Error(firstFailure);
       }
-      toast({ title: "Booking created" });
+
+      if (failedBookings.length > 0) {
+        const failedSummary = failedBookings
+          .slice(0, 3)
+          .map((item) => item.error)
+          .join("; ");
+        toast({
+          title: "Partial booking creation",
+          description: `${createdBookings.length} booking(s) created successfully. ${failedBookings.length} failed: ${failedSummary}`,
+        });
+      }
+
+      // Commission documents are independent of booking creation, so waiting
+      // for one should not serialize every selected unit's booking request.
+      await Promise.all(
+        createdBookings.map(({ range, totalAmount, bookingId }) =>
+          submittedDraft.agentId && bookingId
+            ? createAgentCommission({
+                agentId: submittedDraft.agentId,
+                agentName: submittedDraft.agentName,
+                totalAmount: Number(totalAmount ?? 0),
+                unitId: String(range?.unit?.id ?? ""),
+                unitName: getUnitLabel(range?.unit),
+                checkinDate: range?.checkinDate || "",
+                checkoutDate: range?.checkoutDate || "",
+                guestFirstName: submittedDraft.guestFirstName.trim(),
+                guestLastName: submittedDraft.guestLastName.trim(),
+                bookingId,
+              })
+            : Promise.resolve(),
+        ),
+      );
+
+      if (failedBookings.length > 0) {
+        toast({
+          title: "Bookings created with warnings",
+          description: `${createdBookings.length} booking(s) saved; ${failedBookings.length} failed and were not created.`,
+        });
+      } else {
+        toast({ title: "Booking created" });
+      }
       setIsAddDialogOpen(false);
       clearSelection();
       setBookingDraft(makeDefaultBookingDraft());
@@ -1679,6 +2050,8 @@ export default function CalendarClient() {
     setSaving(true);
     try {
       const payload = { ...detailsBooking };
+      payload.bookingSource = payload.bookingSource || "N/A";
+      payload.bookingLabel = getBookingSourceLabel(payload.bookingSource);
       const sanitizedPayload = removeUndefinedDeep(payload);
       await apiClient.put(
         `/booking/${detailsBooking.id}`,
@@ -1711,7 +2084,49 @@ export default function CalendarClient() {
 
   const handleSaveDetailsSnapshot = async () => {
     if (!detailsBooking || !detailsSnapshotRef.current) return;
-    toast({ title: "Booking image saved" });
+    setImageSaving(true);
+    try {
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame(() => resolve()),
+      );
+      const canvas = await html2canvas(detailsSnapshotRef.current, {
+        backgroundColor: "#0B0B0B",
+        scale: 1,
+        logging: false,
+      });
+      const { mkdir, writeFile, BaseDirectory } =
+        await import("@tauri-apps/plugin-fs");
+      const guestName =
+        [detailsBooking.guestFirstName, detailsBooking.guestLastName]
+          .filter(Boolean)
+          .join("-")
+          .replace(/[\\/:*?"<>|]+/g, "_") || "booking";
+      const bookingDate =
+        toDateInput(getBookingDateValue(detailsBooking)) || todayDateInput();
+      const path = `Bookings/${bookingDate.replace(/-/g, "")}-${guestName}.png`;
+      await mkdir("Bookings", {
+        baseDir: BaseDirectory.Desktop,
+        recursive: true,
+      });
+      await writeFile(path, await canvasToPngBytes(canvas), {
+        baseDir: BaseDirectory.Desktop,
+        create: true,
+      });
+      toast({
+        title: "Booking image saved",
+        description: `Saved to Desktop/${path}`,
+      });
+    } catch (error: any) {
+      console.error("Booking image save failed", error);
+      toast({
+        variant: "destructive",
+        title: "Image save failed",
+        description:
+          error?.message || "The booking image could not be created.",
+      });
+    } finally {
+      setImageSaving(false);
+    }
   };
 
   const handleCopyDetailsAuthorizationLetter = async () => {
@@ -1724,8 +2139,8 @@ export default function CalendarClient() {
     setSaving(true);
     try {
       await apiClient.delete(`/booking/${detailsBooking.id}`, auth);
+      calendarResources.removeBookingRelatedData(String(detailsBooking.id));
       setDetailsBooking(null);
-      await calendarResources.refresh();
       toast({ title: "Booking canceled" });
     } finally {
       setSaving(false);
@@ -1743,20 +2158,34 @@ export default function CalendarClient() {
     );
   }
 
-  const calendarLegend = [
-    { label: "Paid", color: "#16a34a" },
-    { label: "Unpaid", color: "#dc2626" },
-    { label: "Upcoming", color: "#2563eb" },
-    { label: "Checked In", color: "#7c3aed" },
-    { label: "Due for Checkout", color: "#f97316" },
-    { label: "Checked Out", color: "#94a3b8" },
-    { label: "Selected Date", outlined: true },
+  const isAug29BlockVisible = daysInMonth.some(
+    (day) => format(day, "yyyy-MM-dd") === AUG29_BLOCK_DATE,
+  );
+  const isWinterClosureVisible = daysInMonth.some((day) =>
+    isWinterClosureDate(format(day, "yyyy-MM-dd")),
+  );
+  const calendarLegend = Object.entries(bookingLabelStyles).map(
+    ([label, color]) => ({ label, color }),
+  );
+  const selectedOperationsStatus = operationsBooking
+    ? getOperationsStatus(operationsBooking, clockNow)
+    : null;
+  const operationsTimeline = [
+    { key: "upcoming", label: "Upcoming" },
+    { key: "checked-in", label: "Checked In" },
+    { key: "due-for-checkout", label: "Due for Checkout" },
+    { key: "checked-out", label: "Checked Out" },
   ];
+  const selectedTimelineStage = selectedOperationsStatus
+    ? operationsTimeline.findIndex(
+        (item) => item.key === selectedOperationsStatus.key,
+      )
+    : -1;
 
   return (
     <div
       className={cn(
-        "space-y-4 animate-in fade-in duration-500 pb-8",
+        "space-y-3 animate-in fade-in duration-500 pb-6",
         isFullScreen &&
           "fixed inset-0 z-50 flex h-screen flex-col overflow-hidden bg-[hsl(var(--bg-primary))] p-0 pb-0 animate-in fade-in zoom-in-95 duration-200",
       )}
@@ -1784,7 +2213,7 @@ export default function CalendarClient() {
 
       <div
         className={cn(
-          "rounded-[28px] border border-[var(--border)] bg-[var(--bg-surface)] p-4 shadow-[0_20px_60px_-38px_rgba(15,23,42,0.35)] md:p-5",
+          "rounded-[28px] border border-[var(--border)] bg-[var(--bg-surface)] p-3 shadow-[0_20px_60px_-38px_rgba(15,23,42,0.35)] md:p-4",
           isFullScreen &&
             "shrink-0 rounded-none border-x-0 border-t-0 p-0 shadow-none",
         )}
@@ -1796,7 +2225,7 @@ export default function CalendarClient() {
             isFullScreen && "hidden",
           )}
         >
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between lg:gap-6">
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between lg:gap-4">
             <div className="flex items-center gap-3">
               <div className="flex h-11 w-11 items-center justify-center rounded-full bg-[hsl(var(--accent))] text-[hsl(var(--accent-foreground))] shadow-sm">
                 <CalendarRange className="h-5 w-5" />
@@ -1817,7 +2246,7 @@ export default function CalendarClient() {
         </div>
 
         {isFullScreen ? (
-          <div className="sticky top-0 z-50 flex flex-col gap-3 bg-white px-6 py-3 shadow-sm">
+          <div className="sticky top-0 z-50 flex flex-col gap-3 bg-[hsl(var(--bg-surface))] px-6 py-3 shadow-sm">
             <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
               <div className="flex flex-wrap items-center gap-3">
                 <Button
@@ -1861,6 +2290,32 @@ export default function CalendarClient() {
                 )}
 
                 <div className="inline-flex items-center gap-3 rounded-full bg-[hsl(var(--bg-surface))] px-3 py-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className={cn(
+                      "rounded-full border-[var(--border)] bg-transparent text-[hsl(var(--text-primary))]",
+                      isInquiryMode &&
+                        "border-[hsl(var(--accent))] bg-[hsl(var(--accent))] text-[hsl(var(--accent-foreground))]",
+                    )}
+                    onClick={toggleInquiryMode}
+                  >
+                    <CalendarRange className="mr-1.5 h-4 w-4" />
+                    Inquiry
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className={cn(
+                      "rounded-full border-[var(--border)] bg-transparent text-[hsl(var(--text-primary))]",
+                      isOffGrid &&
+                        "border-[hsl(var(--accent))] bg-[hsl(var(--accent))] text-[hsl(var(--accent-foreground))]",
+                    )}
+                    onClick={toggleOffGrid}
+                    aria-pressed={isOffGrid}
+                  >
+                    Off Grid
+                  </Button>
                   <Button
                     variant="outline"
                     size="sm"
@@ -1943,7 +2398,7 @@ export default function CalendarClient() {
         ) : (
           <div
             className={cn(
-              "mt-4 flex flex-col gap-3 rounded-[24px] border border-[var(--border)] bg-[hsl(var(--bg-primary))] p-3 md:flex-row md:items-center md:justify-between",
+              "mt-3 flex flex-col gap-2 rounded-[24px] border border-[var(--border)] bg-[hsl(var(--bg-primary))] p-2.5 md:flex-row md:items-center md:justify-between",
             )}
           >
             <div className="flex flex-wrap items-center gap-2">
@@ -1971,6 +2426,34 @@ export default function CalendarClient() {
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                className={cn(
+                  "shrink-0 rounded-full border-[var(--border)] bg-[hsl(var(--bg-surface))] text-[hsl(var(--text-primary))]",
+                  isInquiryMode &&
+                    "border-[hsl(var(--accent))] bg-[hsl(var(--accent))] text-[hsl(var(--accent-foreground))]",
+                )}
+                onClick={toggleInquiryMode}
+                title="Inquiry mode: select a date range to preview availability without creating a booking"
+              >
+                <CalendarRange className="mr-1.5 h-4 w-4" />
+                Inquiry
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className={cn(
+                  "shrink-0 rounded-full border-[var(--border)] bg-[hsl(var(--bg-surface))] text-[hsl(var(--text-primary))]",
+                  isOffGrid &&
+                    "border-[hsl(var(--accent))] bg-[hsl(var(--accent))] text-[hsl(var(--accent-foreground))]",
+                )}
+                onClick={toggleOffGrid}
+                aria-pressed={isOffGrid}
+                title="Off Grid: let booking bars extend along the timeline instead of snapping to date cells"
+              >
+                Off Grid
+              </Button>
               <div className="flex items-center gap-2 rounded-full border border-[var(--border)] bg-[hsl(var(--bg-surface))] px-2.5 py-1.5">
                 <Building2 className="h-4 w-4 text-[hsl(var(--text-secondary))]" />
                 <Select value={unitFilter} onValueChange={handleUnitFilter}>
@@ -2057,601 +2540,1059 @@ export default function CalendarClient() {
         )}
       </div>
 
-      <Card
+      <div
         className={cn(
-          "overflow-hidden rounded-[28px] border border-[var(--border)] bg-[var(--bg-surface)] shadow-[0_24px_90px_-44px_rgba(15,23,42,0.4)]",
-          isFullScreen &&
-            "flex min-h-0 flex-1 flex-col rounded-none border-x-0 border-b-0 shadow-none",
+          "grid min-w-0 gap-3 xl:grid-cols-[minmax(0,1fr)_280px]",
+          isFullScreen && "block",
         )}
-        role="region"
-        aria-label="Calendar"
-        id="calendar-card"
       >
-        {(!isFullScreen || isUnitLegendOpen) && (
-          <div
+        <div className="min-w-0">
+          <Card
             className={cn(
-              "border-b border-[var(--border)] bg-[hsl(var(--bg-primary))] px-4 py-3",
-              isFullScreen && "shrink-0 px-3 py-2",
+              "overflow-hidden rounded-[28px] border border-[var(--border)] bg-[var(--bg-surface)] shadow-[0_24px_90px_-44px_rgba(15,23,42,0.4)]",
+              isFullScreen &&
+                "flex min-h-0 flex-1 flex-col rounded-none border-x-0 border-b-0 shadow-none",
             )}
+            role="region"
+            aria-label="Calendar"
+            id="calendar-card"
           >
-            <div className="flex flex-col gap-2">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-[0.32em] text-[hsl(var(--text-secondary))]">
-                  <span className="inline-flex h-2.5 w-2.5 rounded-full bg-[hsl(var(--accent))]" />
-                  Unit Legend
+            {(!isFullScreen || isUnitLegendOpen) && (
+              <div
+                className={cn(
+                  "border-b border-[var(--border)] bg-[hsl(var(--bg-primary))] px-3 py-2",
+                  isFullScreen && "shrink-0 px-3 py-1.5",
+                )}
+              >
+                <div className="flex flex-col gap-1.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-[0.32em] text-[hsl(var(--text-secondary))]">
+                      <span className="inline-flex h-2.5 w-2.5 rounded-full bg-[hsl(var(--accent))]" />
+                      Unit Legend
+                    </div>
+                  </div>
+                  {(() => {
+                    const groupedUnits = new Map<string, typeof displayUnits>();
+                    displayUnits.forEach((unit) => {
+                      const type = (unit.type || "UNIT").toLowerCase();
+                      const category = type.includes("park")
+                        ? "Parking Units"
+                        : "Residential Units";
+                      if (!groupedUnits.has(category))
+                        groupedUnits.set(category, []);
+                      groupedUnits.get(category)!.push(unit);
+                    });
+                    const categories = Array.from(groupedUnits.entries());
+                    return (
+                      <div className="flex flex-col gap-2">
+                        {categories.map(([category, categoryUnits]) => (
+                          <div key={category}>
+                            <p className="mb-1 text-[10px] font-bold uppercase tracking-[0.24em] text-[hsl(var(--text-secondary))]">
+                              {category}
+                            </p>
+                            <div className="flex flex-wrap gap-1.5">
+                              {categoryUnits.map((unit) => {
+                                const unitColor =
+                                  unitColorMap.get(String(unit.id)) ||
+                                  "#94a3b8";
+                                const unitLabel =
+                                  unit.unitNumber ||
+                                  unit.name ||
+                                  "Unnamed Unit";
+                                return (
+                                  <div
+                                    key={`legend-${unit.id}`}
+                                    className="flex items-center gap-1.5 rounded-full border border-[var(--border)] bg-[hsl(var(--bg-surface))] px-2 py-0.5 text-[11px] font-semibold text-[hsl(var(--text-primary))]"
+                                  >
+                                    <span
+                                      className="h-2.5 w-2.5 rounded-full"
+                                      style={{ backgroundColor: unitColor }}
+                                    />
+                                    <span className="truncate">
+                                      {unitLabel}
+                                    </span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })()}
                 </div>
               </div>
-              {(() => {
-                const groupedUnits = new Map<string, typeof displayUnits>();
-                displayUnits.forEach((unit) => {
-                  const type = (unit.type || "UNIT").toLowerCase();
-                  const category = type.includes("park")
-                    ? "Parking Units"
-                    : "Residential Units";
-                  if (!groupedUnits.has(category))
-                    groupedUnits.set(category, []);
-                  groupedUnits.get(category)!.push(unit);
-                });
-                const categories = Array.from(groupedUnits.entries());
-                return (
-                  <div className="flex flex-col gap-3">
-                    {categories.map(([category, categoryUnits]) => (
-                      <div key={category}>
-                        <p className="mb-1.5 text-[10px] font-bold uppercase tracking-[0.24em] text-[hsl(var(--text-secondary))]">
-                          {category}
+            )}
+            <ScrollArea
+              className={cn(
+                "w-full h-[calc(100vh-310px)]",
+                isFullScreen && "min-h-0 flex-1 h-full",
+              )}
+            >
+              <div
+                ref={calendarScrollRef}
+                data-calendar-mode={isOffGrid ? "off-grid" : "grid"}
+                className={cn(
+                  "select-none",
+                  isFullScreen ? "min-w-0 w-full" : "min-w-[1200px]",
+                )}
+              >
+                <div className="sticky top-0 z-30 flex border-b border-[var(--border)] bg-[hsl(var(--bg-surface))]">
+                  <div
+                    className="sticky left-0 z-40 flex w-[120px] shrink-0 items-center justify-center border-b border-r border-[var(--border)] bg-[hsl(var(--bg-surface))] px-2 text-[9px] font-bold uppercase tracking-[0.18em] text-[hsl(var(--text-secondary))] shadow-[2px_0_6px_-3px_rgba(15,23,42,0.25)]"
+                    style={{ height: `${computedHeaderHeight}px` }}
+                  >
+                    Unit
+                  </div>
+                  {daysInMonth.map((day) => {
+                    const dateStr = format(day, "yyyy-MM-dd");
+                    const selected = isSameDay(day, new Date());
+                    const isBlockedHeader =
+                      dateStr === AUG29_BLOCK_DATE ||
+                      isWinterClosureDate(dateStr);
+                    const dayOfWeek = day.getDay();
+                    const isSunday = dayOfWeek === 0;
+                    const isSaturday = dayOfWeek === 6;
+                    return (
+                      <div
+                        key={dateStr}
+                        data-calendar-day={dateStr}
+                        className="relative flex shrink-0 flex-col items-center justify-center border-b border-r border-[var(--border)] bg-[hsl(var(--bg-surface))] px-1 text-center"
+                        style={dayStyle}
+                      >
+                        <span
+                          className={cn(
+                            "text-[10px] font-bold uppercase tracking-[0.2em]",
+                            isSunday && "text-red-500",
+                            isSaturday && "text-blue-500",
+                            !isSunday &&
+                              !isSaturday &&
+                              "text-[hsl(var(--text-secondary))]",
+                          )}
+                        >
+                          {format(day, "EEE").toUpperCase()}
+                        </span>
+                        <span
+                          className={cn(
+                            "mt-0.5 flex h-6 w-6 items-center justify-center text-xs font-bold",
+                            selected
+                              ? "rounded-full bg-orange-500 text-white"
+                              : "text-[hsl(var(--text-primary))]",
+                          )}
+                        >
+                          {day.getDate()}
+                        </span>
+                        {isBlockedHeader && (
+                          <span className="absolute bottom-0.5 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-full bg-red-500 px-1.5 py-px text-[7px] font-bold uppercase tracking-wide text-white">
+                            Blocked
+                          </span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {displayUnits.map((unit, unitIndex) => {
+                  const unitColor =
+                    unitColorMap.get(String(unit.id)) || "#94a3b8";
+                  const unitBars = bookingBarsByUnit.get(String(unit.id)) || [];
+                  return (
+                    <div
+                      key={unit.id}
+                      className="relative flex min-w-max border-b border-[var(--border)] last:border-b-0"
+                    >
+                      <div
+                        className={cn(
+                          "sticky left-0 z-20 flex w-[120px] shrink-0 flex-col items-center justify-center border-r border-[var(--border)] bg-[hsl(var(--bg-surface))] px-1.5 text-center shadow-[2px_0_6px_-3px_rgba(15,23,42,0.25)]",
+                          isFullScreen && "px-2",
+                        )}
+                        style={{
+                          height: `${computedCellHeight}px`,
+                          borderLeft: `4px solid ${unitColor}`,
+                        }}
+                      >
+                        <div className="flex w-full min-w-0 items-center justify-center gap-1">
+                          <span
+                            className="h-2 w-2 rounded-full"
+                            style={{ backgroundColor: unitColor }}
+                          />
+                          <span
+                            title={
+                              unit.unitNumber || unit.name || "Unnamed Unit"
+                            }
+                            className="min-w-0 break-words text-[11px] font-bold leading-3 text-[hsl(var(--text-primary))]"
+                          >
+                            {unit.unitNumber || unit.name || "Unnamed Unit"}
+                          </span>
+                        </div>
+                        <span className="mt-0.5 max-w-full truncate text-[8px] font-bold uppercase leading-none tracking-[0.16em] text-[hsl(var(--text-secondary))]">
+                          {unit.type || "UNIT"}
+                        </span>
+                      </div>
+
+                      <div
+                        className="relative flex"
+                        style={{
+                          ["--day-width" as any]: dayStyle?.width || "144px",
+                        }}
+                      >
+                        {daysInMonth.map((day, dayIndex) => {
+                          const dateStr = format(day, "yyyy-MM-dd");
+                          const cell = {
+                            unitId: String(unit.id),
+                            unitIndex,
+                            date: dateStr,
+                            dayIndex,
+                          };
+                          const bookingForCell = findBookingForCell(unit, day);
+                          const isBooked = Boolean(bookingForCell);
+                          const pillStatus = isBooked
+                            ? getPillStatus(bookingForCell)
+                            : null;
+                          const paymentStatus = isBooked
+                            ? getPaymentStatus(bookingForCell)
+                            : null;
+                          const isSelected = previewSelectedCellKeys.has(
+                            cellKey(cell),
+                          );
+                          const isInInquiryRange =
+                            inquiryRangeDateSet.has(dateStr);
+                          const isInquiryStart = inquiryStartDate === dateStr;
+                          const isInquiryEnd = inquiryEndDate === dateStr;
+                          const isBeingRemoved =
+                            dragAction === "remove" &&
+                            dragCellKeys.has(cellKey(cell));
+                          const isToday = isSameDay(day, new Date());
+                          const isAug29Blocked =
+                            !isBooked && isCalendarBlockedCell(unit, dateStr);
+                          const bookingPreviewAgent = isBooked
+                            ? (agents as any[]).find(
+                                (agent) =>
+                                  String(agent.id) ===
+                                  String(
+                                    bookingForCell?.agentId ||
+                                      bookingForCell?.agent_id ||
+                                      "",
+                                  ),
+                              )
+                            : null;
+                          const bookingPreviewUnit = isBooked
+                            ? getBookingUnit(bookingForCell)
+                            : null;
+                          const bookingPreviewProperty = isBooked
+                            ? bookingPreviewUnit?.propertyName ||
+                              bookingPreviewUnit?.property ||
+                              bookingPreviewUnit?.propertyLabel ||
+                              bookingPreviewUnit?.building?.name ||
+                              ""
+                            : "";
+                          const bookingPreviewCheckin =
+                            bookingForCell?.checkinDate ||
+                            bookingForCell?.checkIn ||
+                            "";
+                          const bookingPreviewCheckout =
+                            bookingForCell?.checkoutDate ||
+                            bookingForCell?.checkOut ||
+                            "";
+                          const bookingPreviewNights =
+                            bookingPreviewCheckin && bookingPreviewCheckout
+                              ? Math.max(
+                                  1,
+                                  Math.round(
+                                    (new Date(
+                                      bookingPreviewCheckout,
+                                    ).getTime() -
+                                      new Date(
+                                        bookingPreviewCheckin,
+                                      ).getTime()) /
+                                      86400000,
+                                  ),
+                                )
+                              : 0;
+                          const bookingPreviewAmount = Number(
+                            bookingForCell?.totalAmount ||
+                              bookingForCell?.amount ||
+                              0,
+                          );
+                          const barForCell = unitBars.find(
+                            (bar: any) => bar.startIndex === dayIndex,
+                          );
+
+                          return (
+                            <TooltipProvider
+                              key={`${unit.id}-${dateStr}`}
+                              delayDuration={0}
+                              skipDelayDuration={0}
+                            >
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <div
+                                    role="button"
+                                    tabIndex={0}
+                                    key={`${unit.id}-${dateStr}`}
+                                    className={cn(
+                                      "relative flex shrink-0 items-start justify-center border-r border-[var(--border)] p-0.5 text-left transition-all duration-150",
+                                      isBooked
+                                        ? "cursor-pointer hover:bg-[hsl(var(--secondary))]"
+                                        : "cursor-crosshair hover:bg-[hsl(var(--secondary))]",
+                                      isSelected &&
+                                        "bg-orange-50 border-orange-300",
+                                      isInInquiryRange &&
+                                        "bg-[hsl(var(--accent))]/15",
+                                      (isInquiryStart || isInquiryEnd) &&
+                                        "bg-[hsl(var(--accent))]/25 ring-1 ring-inset ring-[hsl(var(--accent))]",
+                                      isBeingRemoved &&
+                                        "bg-red-50 border-red-300",
+                                      isAug29Blocked &&
+                                        "cursor-not-allowed bg-red-100 dark:bg-red-950/40",
+                                      isFullScreen && "relative z-0",
+                                    )}
+                                    style={dayStyle}
+                                    onMouseDown={(event) => {
+                                      if (isInquiryMode) {
+                                        event.preventDefault();
+                                        handleInquiryDateSelect(dateStr);
+                                        return;
+                                      }
+                                      if (!isBooked) {
+                                        event.preventDefault();
+                                        handleAvailableMouseDown(cell);
+                                      } else {
+                                        // Fast-path: select opened booking immediately on mouse down for instant feedback
+                                        setOperationsBooking(bookingForCell);
+                                        // Toggle multi-selection for bookings (operational review)
+                                        try {
+                                          const id = String(
+                                            bookingForCell?.id ||
+                                              bookingForCell?.bookingId ||
+                                              "",
+                                          );
+                                          setSelectedBookings((prev) => {
+                                            const next = new Set(prev);
+                                            if (next.has(id)) next.delete(id);
+                                            else if (id) next.add(id);
+                                            return next;
+                                          });
+                                        } catch (e) {
+                                          // ignore
+                                        }
+                                      }
+                                    }}
+                                    onClick={() => {
+                                      if (isInquiryMode) return;
+                                      if (isBooked) {
+                                        clearSelection();
+                                        setOperationsBooking(bookingForCell);
+                                      }
+                                    }}
+                                    onKeyDown={(event) => {
+                                      if (
+                                        event.key === "Enter" ||
+                                        event.key === " "
+                                      ) {
+                                        event.preventDefault();
+                                        if (isInquiryMode) {
+                                          handleInquiryDateSelect(dateStr);
+                                          return;
+                                        }
+                                        if (isBooked) {
+                                          clearSelection();
+                                          setOperationsBooking(bookingForCell);
+                                          return;
+                                        }
+                                        if (isAug29Blocked) return;
+                                        handleToggleSelection(cell);
+                                      }
+                                    }}
+                                    onMouseEnter={() => {
+                                      if (isInquiryMode || !dragAnchor) return;
+                                      const currentDragTargetKey = dragTarget
+                                        ? cellKey(dragTarget)
+                                        : null;
+                                      if (
+                                        currentDragTargetKey === cellKey(cell)
+                                      ) {
+                                        return;
+                                      }
+                                      setDragTarget(cell);
+                                    }}
+                                    onDoubleClick={(event) => {
+                                      if (isInquiryMode) {
+                                        event.preventDefault();
+                                        handleInquiryDateSelect(dateStr);
+                                        return;
+                                      }
+                                      if (!isBooked) return;
+                                      event.preventDefault();
+                                      clearSelection();
+                                      setOperationsBooking(bookingForCell);
+                                    }}
+                                  >
+                                    {isSelected ? (
+                                      <div className="absolute inset-0 flex items-center justify-center">
+                                        <CalendarPlus className="h-5 w-5 text-[hsl(var(--accent))]/60 pointer-events-none" />
+                                      </div>
+                                    ) : null}
+                                    {isInInquiryRange && (
+                                      <div className="pointer-events-none absolute inset-x-1 top-1 h-0.5 rounded-full bg-[hsl(var(--accent))]" />
+                                    )}
+                                    {isAug29Blocked && (
+                                      <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                                        <span className="rotate-[-16deg] text-[9px] font-bold uppercase tracking-wide text-red-600 dark:text-red-300">
+                                          Blocked
+                                        </span>
+                                      </div>
+                                    )}
+                                  </div>
+                                </TooltipTrigger>
+                                {isBooked &&
+                                bookingForCell &&
+                                isDesktopHover ? (
+                                  <TooltipContent
+                                    side="top"
+                                    align="start"
+                                    className="w-[248px] rounded-2xl border border-[var(--border)] bg-[hsl(var(--popover))] p-3 text-[hsl(var(--popover-foreground))] shadow-[0_20px_70px_-35px_rgba(15,23,42,0.6)] data-[state=delayed-open]:animate-in data-[state=delayed-open]:fade-in data-[state=delayed-open]:zoom-in-95"
+                                  >
+                                    <div className="space-y-2">
+                                      <div className="flex items-center gap-2">
+                                        <span
+                                          className="inline-flex h-2 w-2 shrink-0 rounded-full"
+                                          style={{
+                                            backgroundColor:
+                                              pillStatus?.color || "#22c55e",
+                                          }}
+                                        />
+                                        <p className="min-w-0 truncate text-sm font-semibold text-[hsl(var(--text-primary))]">
+                                          {getBookingGuestName(bookingForCell)}
+                                        </p>
+                                        <span
+                                          className={cn(
+                                            "ml-auto rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide",
+                                            pillStatus?.key === "upcoming" &&
+                                              "bg-blue-50 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300",
+                                            pillStatus?.key === "checked-in" &&
+                                              "bg-violet-50 text-violet-700 dark:bg-violet-500/15 dark:text-violet-300",
+                                            pillStatus?.key ===
+                                              "due-for-checkout" &&
+                                              "bg-orange-50 text-orange-700 dark:bg-orange-500/15 dark:text-orange-300",
+                                            pillStatus?.key === "checked-out" &&
+                                              "bg-slate-100 text-slate-700 dark:bg-slate-500/15 dark:text-slate-300",
+                                          )}
+                                        >
+                                          {pillStatus?.label || "Upcoming"}
+                                        </span>
+                                      </div>
+
+                                      <div className="grid grid-cols-[78px_1fr] gap-x-2 gap-y-1 text-[11px]">
+                                        <span className="font-semibold text-[hsl(var(--text-secondary))]">
+                                          Booking ID
+                                        </span>
+                                        <span className="truncate text-[hsl(var(--text-primary))]">
+                                          {bookingForCell.id || "N/A"}
+                                        </span>
+
+                                        {bookingPreviewProperty && (
+                                          <>
+                                            <span className="font-semibold text-[hsl(var(--text-secondary))]">
+                                              Property
+                                            </span>
+                                            <span className="truncate text-[hsl(var(--text-primary))]">
+                                              {bookingPreviewProperty}
+                                            </span>
+                                          </>
+                                        )}
+
+                                        <span className="font-semibold text-[hsl(var(--text-secondary))]">
+                                          Unit
+                                        </span>
+                                        <span className="truncate text-[hsl(var(--text-primary))]">
+                                          {getBookingUnitName(bookingForCell)}
+                                        </span>
+
+                                        <span className="font-semibold text-[hsl(var(--text-secondary))]">
+                                          Check-in
+                                        </span>
+                                        <span className="truncate text-[hsl(var(--text-primary))]">
+                                          {formatBookingCardDate(
+                                            bookingPreviewCheckin,
+                                          )}
+                                        </span>
+
+                                        <span className="font-semibold text-[hsl(var(--text-secondary))]">
+                                          Check-out
+                                        </span>
+                                        <span className="truncate text-[hsl(var(--text-primary))]">
+                                          {formatBookingCardDate(
+                                            bookingPreviewCheckout,
+                                          )}
+                                        </span>
+
+                                        <span className="font-semibold text-[hsl(var(--text-secondary))]">
+                                          Payment
+                                        </span>
+                                        <span className="truncate text-[hsl(var(--text-primary))]">
+                                          {paymentStatus?.label || "Unpaid"}
+                                        </span>
+
+                                        <span className="font-semibold text-[hsl(var(--text-secondary))]">
+                                          Booking status
+                                        </span>
+                                        <span className="truncate text-[hsl(var(--text-primary))]">
+                                          {pillStatus?.label || "Upcoming"}
+                                        </span>
+
+                                        <span className="font-semibold text-[hsl(var(--text-secondary))]">
+                                          Nights
+                                        </span>
+                                        <span className="truncate text-[hsl(var(--text-primary))]">
+                                          {bookingPreviewNights}
+                                        </span>
+
+                                        <span className="font-semibold text-[hsl(var(--text-secondary))]">
+                                          Amount
+                                        </span>
+                                        <span className="truncate text-[hsl(var(--text-primary))]">
+                                          {formatCurrency(bookingPreviewAmount)}
+                                        </span>
+
+                                        {bookingPreviewAgent && (
+                                          <>
+                                            <span className="font-semibold text-[hsl(var(--text-secondary))]">
+                                              Agent
+                                            </span>
+                                            <span className="truncate text-[hsl(var(--text-primary))]">
+                                              {getAgentLabel(
+                                                bookingPreviewAgent,
+                                              )}
+                                            </span>
+                                          </>
+                                        )}
+                                      </div>
+
+                                      {(bookingForCell.notes ||
+                                        bookingForCell.specialRequests) && (
+                                        <div className="rounded-xl border border-[var(--border)] bg-[hsl(var(--bg-primary))] p-2">
+                                          <p className="mb-1 text-[10px] font-bold uppercase tracking-[0.22em] text-[hsl(var(--text-secondary))]">
+                                            Notes
+                                          </p>
+                                          <p className="text-[11px] leading-5 text-[hsl(var(--text-primary))]">
+                                            {bookingForCell.notes ||
+                                              bookingForCell.specialRequests}
+                                          </p>
+                                        </div>
+                                      )}
+                                    </div>
+                                  </TooltipContent>
+                                ) : null}
+                              </Tooltip>
+                            </TooltipProvider>
+                          );
+                        })}
+                        {unitBars.map((bar: any) => {
+                          const dayWidthValue = dayStyle?.width || "144px";
+                          const dw =
+                            typeof dayWidthValue === "string"
+                              ? parseInt(dayWidthValue) || 144
+                              : 144;
+                          const barLeftDays = isOffGrid
+                            ? (bar.fracStart ?? bar.startIndex)
+                            : bar.startIndex;
+                          const barWidthDays = isOffGrid
+                            ? (bar.fracWidth ?? bar.span)
+                            : bar.span;
+                          return (
+                            <div
+                              key={`bar-${getCalendarBookingIdentity(bar.booking)}-${bar.startIndex}-${bar.endIndex}`}
+                              className="pointer-events-none absolute z-10"
+                              style={{
+                                left: barLeftDays * dw,
+                                width: barWidthDays * dw,
+                                top:
+                                  3 +
+                                  (bar.lane || 0) *
+                                    Math.max(
+                                      15,
+                                      Math.floor(
+                                        (computedCellHeight - 6) /
+                                          (bar.laneCount || 1),
+                                      ),
+                                    ),
+                                height: Math.max(
+                                  13,
+                                  Math.floor(
+                                    (computedCellHeight - 6) /
+                                      (bar.laneCount || 1),
+                                  ) - 2,
+                                ),
+                              }}
+                            >
+                              <ReservationBar
+                                booking={bar.booking}
+                                span={bar.span}
+                                dayWidth={dayWidthValue}
+                                unitColor={
+                                  bookingLabelStyles[
+                                    getBookingLabel(bar.booking)
+                                  ]
+                                }
+                                paymentStatus={bar.paymentStatus}
+                                pillStatus={bar.pillStatus}
+                                bookingLabel={getBookingLabel(bar.booking)}
+                                isFullScreen={isFullScreen}
+                                calendarZoom={calendarZoom}
+                                clippedStart={bar.clippedStart}
+                                clippedEnd={bar.clippedEnd}
+                                selectedBookingIds={Array.from(
+                                  selectedBookings,
+                                )}
+                              />
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <ScrollBar orientation="horizontal" />
+            </ScrollArea>
+
+            <div className="flex flex-wrap items-center gap-2.5 border-t border-[var(--border)] bg-[hsl(var(--bg-primary))] px-3 py-2">
+              <span className="mr-1 text-[10px] font-bold uppercase tracking-wide text-[hsl(var(--text-secondary))]">
+                Legend
+              </span>
+              {calendarLegend.map((item) => (
+                <div
+                  key={item.label}
+                  className="flex items-center gap-1 rounded-full border border-[var(--border)] bg-[hsl(var(--bg-surface))] px-2 py-0.5 text-[10px] font-bold text-[hsl(var(--text-primary))]"
+                >
+                  <span
+                    className="h-2 w-2 rounded-full"
+                    style={{ backgroundColor: item.color }}
+                  />
+                  <span>{item.label}</span>
+                </div>
+              ))}
+            </div>
+          </Card>
+        </div>
+
+        {!isFullScreen && (
+          <aside
+            className="space-y-3 xl:sticky xl:top-4 xl:self-start"
+            aria-label="Calendar details"
+          >
+            <section className="rounded-2xl border border-[var(--border)] bg-[hsl(var(--bg-surface))] p-3 shadow-sm">
+              <h2 className="text-xs font-bold uppercase tracking-wide text-[hsl(var(--text-primary))]">
+                Inquiry
+              </h2>
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                <label className="min-w-0 text-[9px] font-bold uppercase tracking-wide text-[hsl(var(--text-secondary))]">
+                  Check-in
+                  <input
+                    type="date"
+                    value={inquiryStartDate || ""}
+                    onChange={(event) =>
+                      updateInquiryDate("start", event.target.value)
+                    }
+                    className="mt-1 block h-8 w-full rounded-lg border border-[var(--border)] bg-[hsl(var(--bg-primary))] px-2 text-[10px] font-semibold text-[hsl(var(--text-primary))] outline-none focus:ring-1 focus:ring-[hsl(var(--accent))]"
+                  />
+                </label>
+                <label className="min-w-0 text-[9px] font-bold uppercase tracking-wide text-[hsl(var(--text-secondary))]">
+                  Check-out
+                  <input
+                    type="date"
+                    min={inquiryStartDate || undefined}
+                    value={inquiryEndDate || ""}
+                    onChange={(event) =>
+                      updateInquiryDate("end", event.target.value)
+                    }
+                    className="mt-1 block h-8 w-full rounded-lg border border-[var(--border)] bg-[hsl(var(--bg-primary))] px-2 text-[10px] font-semibold text-[hsl(var(--text-primary))] outline-none focus:ring-1 focus:ring-[hsl(var(--accent))]"
+                  />
+                </label>
+              </div>
+              {inquiryStartDate &&
+                inquiryEndDate &&
+                inquiryEndDate > inquiryStartDate && (
+                  <p className="mt-2 text-center text-[10px] font-bold text-[hsl(var(--text-secondary))]">
+                    {inquiryRangeDates.length} night
+                    {inquiryRangeDates.length === 1 ? "" : "s"}
+                  </p>
+                )}
+              <div className="mt-2 grid grid-cols-4 gap-1">
+                {[
+                  ["Today", 0],
+                  ["Tomorrow", 1],
+                  ["+3 Days", 3],
+                  ["+7 Days", 7],
+                ].map(([label, offset]) => (
+                  <Button
+                    key={String(label)}
+                    variant="outline"
+                    size="sm"
+                    className="h-7 rounded-md px-1 text-[9px]"
+                    onClick={() => setInquiryQuickRange(Number(offset))}
+                  >
+                    {label}
+                  </Button>
+                ))}
+              </div>
+              <Button
+                className="mt-2.5 w-full rounded-lg bg-[hsl(var(--accent))] text-[hsl(var(--accent-foreground))] hover:opacity-90"
+                size="sm"
+                onClick={checkInquiryAvailability}
+              >
+                Check Availability
+              </Button>
+              {inquiryResults && inquiryResults.availableCount > 0 && (
+                <div className="mt-3 border-t border-[var(--border)] pt-3">
+                  <p className="text-[10px] font-bold uppercase tracking-wide text-[hsl(var(--text-secondary))]">
+                    Available units
+                  </p>
+                  <p className="mt-0.5 text-[11px] font-semibold text-[hsl(var(--text-primary))]">
+                    {inquiryResults.availableCount} units available
+                  </p>
+                  <div className="mt-2 space-y-1.5">
+                    {inquiryResults.rows
+                      .filter((row) => row.available)
+                      .map((row) => (
+                        <div
+                          key={String(row.unit?.id)}
+                          className="flex items-center gap-2 rounded-lg bg-[hsl(var(--bg-primary))] px-2 py-1.5"
+                        >
+                          <span
+                            className="h-2 w-2 shrink-0 rounded-full"
+                            style={{
+                              backgroundColor:
+                                unitColorMap.get(String(row.unit?.id)) ||
+                                "#16a34a",
+                            }}
+                          />
+                          <div className="min-w-0 flex-1">
+                            <p className="truncate text-[11px] font-bold text-[hsl(var(--text-primary))]">
+                              {row.unit?.unitNumber || row.unit?.name}
+                            </p>
+                            <p className="text-[9px] font-medium text-emerald-600 dark:text-emerald-400">
+                              {row.unit?.type || "Available"} · AVAILABLE
+                            </p>
+                          </div>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-6 rounded-md px-2 text-[9px]"
+                            onClick={() => startInquiryBooking(row.unit)}
+                          >
+                            Add Booking
+                          </Button>
+                        </div>
+                      ))}
+                  </div>
+                </div>
+              )}
+              {inquiryResults && inquiryResults.availableCount === 0 && (
+                <div className="mt-3 border-t border-[var(--border)] pt-3 text-center">
+                  <p className="text-[10px] font-bold uppercase tracking-wide text-[hsl(var(--text-primary))]">
+                    No units available
+                  </p>
+                  <p className="mt-1 text-[10px] text-[hsl(var(--text-secondary))]">
+                    No units are available for {inquiryStartDate} –{" "}
+                    {inquiryEndDate}.
+                  </p>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="mt-2 rounded-lg"
+                    onClick={clearInquiryRange}
+                  >
+                    Change Dates
+                  </Button>
+                </div>
+              )}
+              {(isAug29BlockVisible || isWinterClosureVisible) && (
+                <div className="mt-3 border-t border-[var(--border)] pt-3 text-center">
+                  <p className="text-[11px] font-bold uppercase tracking-wide text-red-600">
+                    {isWinterClosureVisible
+                      ? "Winter closure"
+                      : "Aug 29 blocked"}
+                  </p>
+                  <p className="mt-1 text-[10px] font-medium text-[hsl(var(--text-secondary))]">
+                    {isWinterClosureVisible
+                      ? "Dec 1, 2026 – Jan 31, 2027"
+                      : "Except Shore 3 and 447"}
+                  </p>
+                </div>
+              )}
+            </section>
+
+            <section className="rounded-2xl border border-[var(--border)] bg-[hsl(var(--bg-surface))] p-3 shadow-sm">
+              {operationsBooking ? (
+                <>
+                  <div className="flex items-center justify-between gap-2">
+                    <h2 className="text-xs font-bold uppercase tracking-wide text-[hsl(var(--text-primary))]">
+                      Booking details
+                    </h2>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-6 w-6 rounded-full"
+                      onClick={() => setOperationsBooking(null)}
+                      aria-label="Clear selected booking"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                  {selectedOperationsStatus && (
+                    <>
+                      <span
+                        className="mt-3 inline-flex items-center gap-1 rounded-full px-2 py-1 text-[9px] font-bold"
+                        style={{
+                          backgroundColor: `${selectedOperationsStatus.color}1a`,
+                          color: selectedOperationsStatus.color,
+                        }}
+                      >
+                        <span
+                          className="h-1.5 w-1.5 rounded-full"
+                          style={{
+                            backgroundColor: selectedOperationsStatus.color,
+                          }}
+                        />
+                        {selectedOperationsStatus.label}
+                      </span>
+                      <p className="mt-2 truncate text-sm font-bold text-[hsl(var(--text-primary))]">
+                        {getBookingGuestName(operationsBooking)}
+                      </p>
+                      <div className="mt-3 space-y-2 rounded-xl border border-[var(--border)] p-2.5 text-[10px]">
+                        <p className="font-bold uppercase tracking-[0.16em] text-[hsl(var(--text-secondary))]">
+                          Booking information
                         </p>
-                        <div className="flex flex-wrap gap-2">
-                          {categoryUnits.map((unit) => {
-                            const unitColor =
-                              unitColorMap.get(String(unit.id)) || "#94a3b8";
-                            const unitLabel =
-                              unit.unitNumber || unit.name || "Unnamed Unit";
+                        <div>
+                          <p className="text-[hsl(var(--text-secondary))]">
+                            Unit
+                          </p>
+                          <p className="truncate font-semibold text-[hsl(var(--text-primary))]">
+                            {getBookingUnitName(operationsBooking)}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-[hsl(var(--text-secondary))]">
+                            Check-in
+                          </p>
+                          <p className="font-semibold text-[hsl(var(--text-primary))]">
+                            {formatOperationsDate(
+                              selectedOperationsStatus.checkinAt,
+                            )}{" "}
+                            ·{" "}
+                            {formatOperationsTime(
+                              selectedOperationsStatus.checkinAt,
+                            )}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-[hsl(var(--text-secondary))]">
+                            Check-out
+                          </p>
+                          <p className="font-semibold text-[hsl(var(--text-primary))]">
+                            {formatOperationsDate(
+                              selectedOperationsStatus.checkoutAt,
+                            )}{" "}
+                            ·{" "}
+                            {formatOperationsTime(
+                              selectedOperationsStatus.checkoutAt,
+                            )}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="mt-3 rounded-xl border border-[var(--border)] bg-[hsl(var(--bg-primary))] p-2.5">
+                        <div className="flex items-center gap-1.5 text-[11px] font-bold text-[hsl(var(--text-primary))]">
+                          <TimerReset className="h-3.5 w-3.5 text-[hsl(var(--accent))]" />{" "}
+                          Time Remaining
+                        </div>
+                        <p className="mt-1 text-lg font-bold text-[hsl(var(--text-primary))]">
+                          {formatTimeRemaining(
+                            selectedOperationsStatus.key === "upcoming"
+                              ? selectedOperationsStatus.checkinAt
+                              : selectedOperationsStatus.checkoutAt,
+                            clockNow,
+                          )}
+                        </p>
+                        <p className="text-[10px] text-[hsl(var(--text-secondary))]">
+                          {selectedOperationsStatus.key === "upcoming"
+                            ? "until check-in"
+                            : selectedOperationsStatus.key === "checked-out"
+                              ? "Checkout completed"
+                              : "until checkout"}
+                        </p>
+                      </div>
+                      <div className="mt-3">
+                        <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-[hsl(var(--text-secondary))]">
+                          Status timeline
+                        </p>
+                        <div className="mt-2 space-y-1.5">
+                          {operationsTimeline.map((item, index) => {
+                            const complete = index <= selectedTimelineStage;
+                            const current = index === selectedTimelineStage;
                             return (
                               <div
-                                key={`legend-${unit.id}`}
-                                className="flex items-center gap-2 rounded-full border border-[var(--border)] bg-[hsl(var(--bg-surface))] px-2.5 py-1 text-[11px] font-semibold text-[hsl(var(--text-primary))]"
+                                key={item.key}
+                                className={cn(
+                                  "flex items-center gap-2 text-[10px]",
+                                  current
+                                    ? "font-bold text-[hsl(var(--text-primary))]"
+                                    : "text-[hsl(var(--text-secondary))]",
+                                )}
                               >
                                 <span
-                                  className="h-2.5 w-2.5 rounded-full"
-                                  style={{ backgroundColor: unitColor }}
-                                />
-                                <span className="truncate">{unitLabel}</span>
+                                  className="flex h-4 w-4 items-center justify-center rounded-full"
+                                  style={{
+                                    color: complete
+                                      ? selectedOperationsStatus.color
+                                      : "#94a3b8",
+                                    backgroundColor: complete
+                                      ? `${selectedOperationsStatus.color}1a`
+                                      : "transparent",
+                                  }}
+                                >
+                                  {complete ? (
+                                    <CheckCircle2 className="h-3.5 w-3.5" />
+                                  ) : (
+                                    <Circle className="h-3 w-3" />
+                                  )}
+                                </span>
+                                {item.label}
                               </div>
                             );
                           })}
                         </div>
                       </div>
-                    ))}
-                  </div>
-                );
-              })()}
-            </div>
-          </div>
-        )}
-        <ScrollArea
-          className={cn(
-            "w-full h-[calc(100vh-310px)]",
-            isFullScreen && "min-h-0 flex-1 h-full",
-          )}
-        >
-          <div
-            ref={calendarScrollRef}
-            className={cn(
-              "select-none",
-              isFullScreen ? "min-w-0 w-full" : "min-w-[1200px]",
-            )}
-          >
-            <div className="sticky top-0 z-30 flex border-b border-[var(--border)] bg-white backdrop-blur-md">
-              <div className="sticky left-0 z-40 flex h-[56px] w-[152px] shrink-0 items-center justify-center border-r border-b border-[var(--border)] bg-white px-2 text-[10px] font-bold uppercase tracking-[0.24em] text-[hsl(var(--text-secondary))]">
-                Unit
-              </div>
-              {daysInMonth.map((day) => {
-                const dateStr = format(day, "yyyy-MM-dd");
-                const selected = isSameDay(day, new Date());
-                const dayOfWeek = day.getDay();
-                const isSunday = dayOfWeek === 0;
-                const isSaturday = dayOfWeek === 6;
-                return (
-                  <div
-                    key={dateStr}
-                    data-calendar-day={dateStr}
-                    className="flex h-[56px] w-[144px] shrink-0 flex-col items-center justify-center border-r border-b border-[var(--border)] bg-white px-1.5 text-center"
-                    style={dayStyle}
-                  >
-                    <span
-                      className={cn(
-                        "text-[10px] font-bold uppercase tracking-[0.2em]",
-                        isSunday && "text-red-500",
-                        isSaturday && "text-blue-500",
-                        !isSunday &&
-                          !isSaturday &&
-                          "text-[hsl(var(--text-secondary))]",
-                      )}
-                    >
-                      {format(day, "EEE").toUpperCase()}
-                    </span>
-                    <span
-                      className={cn(
-                        "flex h-6 w-6 items-center justify-center text-xs font-bold",
-                        selected
-                          ? "rounded-full bg-orange-500 text-white"
-                          : "text-[hsl(var(--text-primary))]",
-                      )}
-                    >
-                      {day.getDate()}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-
-            {displayUnits.map((unit, unitIndex) => {
-              const unitColor = unitColorMap.get(String(unit.id)) || "#94a3b8";
-              const unitBars = getBookingBarsForUnit(unit);
-              return (
-                <div
-                  key={unit.id}
-                  className="relative flex min-w-max overflow-hidden border-b border-[var(--border)] last:border-b-0"
-                >
-                  <div
-                    className={cn(
-                      "sticky left-0 z-20 flex w-[152px] shrink-0 flex-col items-center justify-center border-r border-[var(--border)] bg-white px-2 text-center",
-                      isFullScreen && "px-2",
-                    )}
-                    style={{
-                      height: `${computedCellHeight}px`,
-                      borderLeft: `4px solid ${unitColor}`,
-                    }}
-                  >
-                    <div className="flex items-center gap-1.5">
-                      <span
-                        className="h-2 w-2 rounded-full"
-                        style={{ backgroundColor: unitColor }}
-                      />
-                      <span className="text-sm font-bold text-[hsl(var(--text-primary))]">
-                        {unit.unitNumber || unit.name || "Unnamed Unit"}
-                      </span>
-                    </div>
-                    <span className="mt-0.5 text-[10px] font-bold uppercase tracking-[0.28em] text-[hsl(var(--text-secondary))]">
-                      {unit.type || "UNIT"}
-                    </span>
-                  </div>
-
-                  <div
-                    className="relative flex"
-                    style={{
-                      ["--day-width" as any]: dayStyle?.width || "144px",
-                    }}
-                  >
-                    {daysInMonth.map((day, dayIndex) => {
-                      const dateStr = format(day, "yyyy-MM-dd");
-                      const cell = {
-                        unitId: String(unit.id),
-                        unitIndex,
-                        date: dateStr,
-                        dayIndex,
-                      };
-                      const bookingForCell = findBookingForCell(unit, day);
-                      const isBooked = Boolean(bookingForCell);
-                      const pillStatus = isBooked
-                        ? getPillStatus(bookingForCell)
-                        : null;
-                      const paymentStatus = isBooked
-                        ? getPaymentStatus(bookingForCell)
-                        : null;
-                      const isSelected = previewSelectedCellKeys.has(
-                        cellKey(cell),
-                      );
-                      const isBeingRemoved =
-                        dragAction === "remove" &&
-                        dragCellKeys.has(cellKey(cell));
-                      const isToday = isSameDay(day, new Date());
-                      const bookingPreviewAgent = isBooked
-                        ? (agents as any[]).find(
-                            (agent) =>
-                              String(agent.id) ===
-                              String(
-                                bookingForCell?.agentId ||
-                                  bookingForCell?.agent_id ||
-                                  "",
-                              ),
-                          )
-                        : null;
-                      const bookingPreviewUnit = isBooked
-                        ? getBookingUnit(bookingForCell)
-                        : null;
-                      const bookingPreviewProperty = isBooked
-                        ? bookingPreviewUnit?.propertyName ||
-                          bookingPreviewUnit?.property ||
-                          bookingPreviewUnit?.propertyLabel ||
-                          bookingPreviewUnit?.building?.name ||
-                          ""
-                        : "";
-                      const bookingPreviewCheckin =
-                        bookingForCell?.checkinDate ||
-                        bookingForCell?.checkIn ||
-                        "";
-                      const bookingPreviewCheckout =
-                        bookingForCell?.checkoutDate ||
-                        bookingForCell?.checkOut ||
-                        "";
-                      const bookingPreviewNights =
-                        bookingPreviewCheckin && bookingPreviewCheckout
-                          ? Math.max(
-                              1,
-                              Math.round(
-                                (new Date(bookingPreviewCheckout).getTime() -
-                                  new Date(bookingPreviewCheckin).getTime()) /
-                                  86400000,
-                              ),
-                            )
-                          : 0;
-                      const bookingPreviewAmount = Number(
-                        bookingForCell?.totalAmount ||
-                          bookingForCell?.amount ||
-                          0,
-                      );
-                      const barForCell = unitBars.find(
-                        (bar: any) => bar.startIndex === dayIndex,
-                      );
-
-                      return (
-                        <TooltipProvider
-                          key={`${unit.id}-${dateStr}`}
-                          delayDuration={0}
-                          skipDelayDuration={0}
-                        >
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <div
-                                role="button"
-                                tabIndex={0}
-                                key={`${unit.id}-${dateStr}`}
-                                className={cn(
-                                  "relative flex shrink-0 items-start justify-center border-r border-[var(--border)] p-1 text-left transition-all duration-150",
-                                  isBooked
-                                    ? "cursor-pointer hover:bg-[hsl(var(--secondary))]"
-                                    : "cursor-crosshair hover:bg-[hsl(var(--secondary))]",
-                                  isSelected &&
-                                    "bg-orange-50 border-orange-300",
-                                  isBeingRemoved && "bg-red-50 border-red-300",
-                                  isFullScreen && "relative z-0",
-                                )}
-                                style={dayStyle}
-                                onMouseDown={(event) => {
-                                  if (!isBooked) {
-                                    event.preventDefault();
-                                    handleAvailableMouseDown(cell);
-                                  } else {
-                                    // Fast-path: select opened booking immediately on mouse down for instant feedback
-                                    setOperationsBooking(bookingForCell);
-                                    // Toggle multi-selection for bookings (operational review)
-                                    try {
-                                      const id = String(
-                                        bookingForCell?.id ||
-                                          bookingForCell?.bookingId ||
-                                          "",
-                                      );
-                                      setSelectedBookings((prev) => {
-                                        const next = new Set(prev);
-                                        if (next.has(id)) next.delete(id);
-                                        else if (id) next.add(id);
-                                        return next;
-                                      });
-                                    } catch (e) {
-                                      // ignore
-                                    }
-                                  }
-                                }}
-                                onClick={() => {
-                                  if (isBooked) {
-                                    clearSelection();
-                                    setOperationsBooking(bookingForCell);
-                                  }
-                                }}
-                                onKeyDown={(event) => {
-                                  if (
-                                    event.key === "Enter" ||
-                                    event.key === " "
-                                  ) {
-                                    event.preventDefault();
-                                    if (isBooked) {
-                                      clearSelection();
-                                      setOperationsBooking(bookingForCell);
-                                      return;
-                                    }
-                                    handleToggleSelection(cell);
-                                  }
-                                }}
-                                onMouseEnter={() => {
-                                  if (!dragAnchor) return;
-                                  const currentDragTargetKey = dragTarget
-                                    ? cellKey(dragTarget)
-                                    : null;
-                                  if (currentDragTargetKey === cellKey(cell)) {
-                                    return;
-                                  }
-                                  setDragTarget(cell);
-                                }}
-                                onDoubleClick={(event) => {
-                                  if (!isBooked) return;
-                                  event.preventDefault();
-                                  clearSelection();
-                                  setOperationsBooking(bookingForCell);
-                                }}
-                              >
-                                {isSelected ? (
-                                  <div className="absolute inset-0 flex items-center justify-center">
-                                    <CalendarPlus className="h-5 w-5 text-[hsl(var(--accent))]/60 pointer-events-none" />
-                                  </div>
-                                ) : null}
-                              </div>
-                            </TooltipTrigger>
-                            {isBooked && bookingForCell && isDesktopHover ? (
-                              <TooltipContent
-                                side="top"
-                                align="start"
-                                className="w-[248px] rounded-2xl border border-[var(--border)] bg-[hsl(var(--popover))] p-3 text-[hsl(var(--popover-foreground))] shadow-[0_20px_70px_-35px_rgba(15,23,42,0.6)] data-[state=delayed-open]:animate-in data-[state=delayed-open]:fade-in data-[state=delayed-open]:zoom-in-95"
-                              >
-                                <div className="space-y-2">
-                                  <div className="flex items-center gap-2">
-                                    <span
-                                      className="inline-flex h-2 w-2 shrink-0 rounded-full"
-                                      style={{
-                                        backgroundColor:
-                                          pillStatus?.color || "#22c55e",
-                                      }}
-                                    />
-                                    <p className="min-w-0 truncate text-sm font-semibold text-[hsl(var(--text-primary))]">
-                                      {getBookingGuestName(bookingForCell)}
-                                    </p>
-                                    <span
-                                      className={cn(
-                                        "ml-auto rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide",
-                                        pillStatus?.key === "upcoming" &&
-                                          "bg-blue-50 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300",
-                                        pillStatus?.key === "checked-in" &&
-                                          "bg-violet-50 text-violet-700 dark:bg-violet-500/15 dark:text-violet-300",
-                                        pillStatus?.key ===
-                                          "due-for-checkout" &&
-                                          "bg-orange-50 text-orange-700 dark:bg-orange-500/15 dark:text-orange-300",
-                                        pillStatus?.key === "checked-out" &&
-                                          "bg-slate-100 text-slate-700 dark:bg-slate-500/15 dark:text-slate-300",
-                                      )}
-                                    >
-                                      {pillStatus?.label || "Upcoming"}
-                                    </span>
-                                  </div>
-
-                                  <div className="grid grid-cols-[78px_1fr] gap-x-2 gap-y-1 text-[11px]">
-                                    <span className="font-semibold text-[hsl(var(--text-secondary))]">
-                                      Booking ID
-                                    </span>
-                                    <span className="truncate text-[hsl(var(--text-primary))]">
-                                      {bookingForCell.id || "N/A"}
-                                    </span>
-
-                                    {bookingPreviewProperty && (
-                                      <>
-                                        <span className="font-semibold text-[hsl(var(--text-secondary))]">
-                                          Property
-                                        </span>
-                                        <span className="truncate text-[hsl(var(--text-primary))]">
-                                          {bookingPreviewProperty}
-                                        </span>
-                                      </>
-                                    )}
-
-                                    <span className="font-semibold text-[hsl(var(--text-secondary))]">
-                                      Unit
-                                    </span>
-                                    <span className="truncate text-[hsl(var(--text-primary))]">
-                                      {getBookingUnitName(bookingForCell)}
-                                    </span>
-
-                                    <span className="font-semibold text-[hsl(var(--text-secondary))]">
-                                      Check-in
-                                    </span>
-                                    <span className="truncate text-[hsl(var(--text-primary))]">
-                                      {formatBookingCardDate(
-                                        bookingPreviewCheckin,
-                                      )}
-                                    </span>
-
-                                    <span className="font-semibold text-[hsl(var(--text-secondary))]">
-                                      Check-out
-                                    </span>
-                                    <span className="truncate text-[hsl(var(--text-primary))]">
-                                      {formatBookingCardDate(
-                                        bookingPreviewCheckout,
-                                      )}
-                                    </span>
-
-                                    <span className="font-semibold text-[hsl(var(--text-secondary))]">
-                                      Payment
-                                    </span>
-                                    <span className="truncate text-[hsl(var(--text-primary))]">
-                                      {paymentStatus?.label || "Unpaid"}
-                                    </span>
-
-                                    <span className="font-semibold text-[hsl(var(--text-secondary))]">
-                                      Booking status
-                                    </span>
-                                    <span className="truncate text-[hsl(var(--text-primary))]">
-                                      {pillStatus?.label || "Upcoming"}
-                                    </span>
-
-                                    <span className="font-semibold text-[hsl(var(--text-secondary))]">
-                                      Nights
-                                    </span>
-                                    <span className="truncate text-[hsl(var(--text-primary))]">
-                                      {bookingPreviewNights}
-                                    </span>
-
-                                    <span className="font-semibold text-[hsl(var(--text-secondary))]">
-                                      Amount
-                                    </span>
-                                    <span className="truncate text-[hsl(var(--text-primary))]">
-                                      {formatCurrency(bookingPreviewAmount)}
-                                    </span>
-
-                                    {bookingPreviewAgent && (
-                                      <>
-                                        <span className="font-semibold text-[hsl(var(--text-secondary))]">
-                                          Agent
-                                        </span>
-                                        <span className="truncate text-[hsl(var(--text-primary))]">
-                                          {getAgentLabel(bookingPreviewAgent)}
-                                        </span>
-                                      </>
-                                    )}
-                                  </div>
-
-                                  {(bookingForCell.notes ||
-                                    bookingForCell.specialRequests) && (
-                                    <div className="rounded-xl border border-[var(--border)] bg-[hsl(var(--bg-primary))] p-2">
-                                      <p className="mb-1 text-[10px] font-bold uppercase tracking-[0.22em] text-[hsl(var(--text-secondary))]">
-                                        Notes
-                                      </p>
-                                      <p className="text-[11px] leading-5 text-[hsl(var(--text-primary))]">
-                                        {bookingForCell.notes ||
-                                          bookingForCell.specialRequests}
-                                      </p>
-                                    </div>
-                                  )}
-                                </div>
-                              </TooltipContent>
-                            ) : null}
-                          </Tooltip>
-                        </TooltipProvider>
-                      );
-                    })}
-                    {unitBars.map((bar: any) => {
-                      const dayWidthValue = dayStyle?.width || "144px";
-                      const dw =
-                        typeof dayWidthValue === "string"
-                          ? parseInt(dayWidthValue) || 144
-                          : 144;
-                      return (
-                        <div
-                          key={`bar-${getCalendarBookingIdentity(bar.booking)}-${bar.startIndex}-${bar.endIndex}`}
-                          className="pointer-events-none absolute z-10"
-                          style={{
-                            left: bar.startIndex * dw,
-                            width: bar.span * dw,
-                            top:
-                              4 +
-                              (bar.lane || 0) *
-                                Math.max(
-                                  16,
-                                  Math.floor(
-                                    (computedCellHeight - 8) /
-                                      (bar.laneCount || 1),
-                                  ),
-                                ),
-                            height: Math.max(
-                              14,
-                              Math.floor(
-                                (computedCellHeight - 8) / (bar.laneCount || 1),
-                              ) - 2,
-                            ),
-                          }}
-                        >
-                          <ReservationBar
-                            booking={bar.booking}
-                            span={bar.span}
-                            dayWidth={dayWidthValue}
-                            unitColor={unitColor}
-                            paymentStatus={bar.paymentStatus}
-                            pillStatus={bar.pillStatus}
-                            isFullScreen={isFullScreen}
-                            calendarZoom={calendarZoom}
-                            clippedStart={bar.clippedStart}
-                            clippedEnd={bar.clippedEnd}
-                            selectedBookingIds={Array.from(selectedBookings)}
-                          />
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-          <ScrollBar orientation="horizontal" />
-        </ScrollArea>
-
-        <div className="flex flex-wrap items-center gap-3 border-t border-[var(--border)] bg-[hsl(var(--bg-primary))] px-4 py-3">
-          {calendarLegend.map((item) => (
-            <div
-              key={item.label}
-              className="flex items-center gap-2 text-xs font-semibold text-[hsl(var(--text-secondary))]"
-            >
-              {item.outlined ? (
-                <span className="flex h-3.5 w-3.5 items-center justify-center rounded-full border border-[hsl(var(--accent))]">
-                  <span className="h-1.5 w-1.5 rounded-full bg-[hsl(var(--accent))]" />
-                </span>
+                      <Button
+                        size="sm"
+                        className="mt-3 w-full rounded-xl bg-[hsl(var(--accent))] text-[hsl(var(--accent-foreground))] hover:opacity-90"
+                        onClick={() => setDetailsBooking(operationsBooking)}
+                      >
+                        View Booking Details
+                      </Button>
+                    </>
+                  )}
+                </>
               ) : (
-                <span
-                  className="h-2.5 w-2.5 rounded-full"
-                  style={{ backgroundColor: item.color }}
-                />
+                <>
+                  <h2 className="text-xs font-bold uppercase tracking-wide text-[hsl(var(--text-primary))]">
+                    Booking details
+                  </h2>
+                  <div className="mt-3 flex min-h-28 flex-col items-center justify-center rounded-xl border border-dashed border-[var(--border)] bg-[hsl(var(--bg-primary))] px-4 text-center">
+                    <CalendarDays className="mb-2 h-4 w-4 text-[hsl(var(--text-secondary))]" />
+                    <p className="text-[11px] font-semibold text-[hsl(var(--text-primary))]">
+                      Select a booking
+                    </p>
+                    <p className="mt-1 text-[10px] leading-4 text-[hsl(var(--text-secondary))]">
+                      Click a booking bar to view the guest, stay dates,
+                      payment, and status.
+                    </p>
+                  </div>
+                </>
               )}
-              <span>{item.label}</span>
-            </div>
-          ))}
-        </div>
-      </Card>
+            </section>
+          </aside>
+        )}
+      </div>
 
-      {selection.length > 0 && (
+      {(isInquiryMode
+        ? inquiryRangeDates.length > 0
+        : selection.length > 0) && (
         <div
           className={cn(
-            "sticky bottom-4 z-40 mx-auto flex w-fit items-center gap-3 rounded-full border border-[var(--border)] bg-[hsl(var(--bg-surface))] px-4 py-2.5 shadow-[0_20px_60px_-20px_rgba(15,23,42,0.4)]",
+            "sticky bottom-4 z-40 mx-auto flex w-fit flex-col items-center gap-2 rounded-2xl border border-[var(--border)] bg-[hsl(var(--bg-surface))] px-4 py-2.5 shadow-[0_20px_60px_-20px_rgba(15,23,42,0.4)]",
             isFullScreen && "mb-4",
           )}
         >
-          <span className="text-sm font-semibold text-[hsl(var(--text-primary))]">
-            {selection.length} date{selection.length > 1 ? "s" : ""} selected
-          </span>
-          <Button
-            size="sm"
-            variant="outline"
-            className="rounded-full"
-            onClick={clearSelection}
-          >
-            <X className="mr-1.5 h-4 w-4" />
-            Clear Selection
-          </Button>
-          {canManageOperations(role) && (
+          <div className="flex w-full flex-wrap items-center justify-center gap-3">
+            <span className="text-sm font-semibold text-[hsl(var(--text-primary))]">
+              {isInquiryMode ? "Inquiry: " : ""}
+              {isInquiryMode ? inquiryRangeDates.length : selection.length} date
+              {(isInquiryMode ? inquiryRangeDates.length : selection.length) !==
+              1
+                ? "s"
+                : ""}{" "}
+              selected
+            </span>
             <Button
               size="sm"
-              className="rounded-full bg-[hsl(var(--accent))] text-[hsl(var(--accent-foreground))] hover:opacity-90"
-              disabled={selectedRanges.length === 0}
-              onClick={() => {
-                if (selectedRanges.length === 0) return;
-                const firstRange = selectedRanges[0];
-                setBookingDraft(
-                  (prev) =>
-                    ({
-                      ...prev,
-                      bookingDate: todayDateInput(),
-                      checkinDate: firstRange.checkinDate,
-                      checkoutDate: firstRange.checkoutDate,
-                    }) as any,
-                );
-                setIsAddDialogOpen(true);
-              }}
+              variant="outline"
+              className="rounded-full"
+              onClick={isInquiryMode ? clearInquiryRange : clearSelection}
             >
-              <CalendarPlus className="mr-1.5 h-4 w-4" />
-              Book Selected
+              <X className="mr-1.5 h-4 w-4" />
+              Clear Selection
             </Button>
+            {canManageOperations(role) && !isInquiryMode && (
+              <Button
+                size="sm"
+                className="rounded-full bg-[hsl(var(--accent))] text-[hsl(var(--accent-foreground))] hover:opacity-90"
+                disabled={selectedRanges.length === 0}
+                onClick={() => {
+                  if (selectedRanges.length === 0) return;
+                  const firstRange = selectedRanges[0];
+                  setBookingDraft(
+                    (prev) =>
+                      ({
+                        ...prev,
+                        bookingDate: todayDateInput(),
+                        checkinDate: firstRange.checkinDate,
+                        checkoutDate: firstRange.checkoutDate,
+                      }) as any,
+                  );
+                  setIsAddDialogOpen(true);
+                }}
+              >
+                <CalendarPlus className="mr-1.5 h-4 w-4" />
+                Book Selected
+              </Button>
+            )}
+          </div>
+          {isInquiryMode && inquiryResults && (
+            <div className="flex w-full flex-col gap-1.5 border-t border-[var(--border)] pt-2">
+              <div className="flex flex-wrap items-center justify-center gap-3 text-xs font-semibold">
+                <span className="flex items-center gap-1.5 text-emerald-600 dark:text-emerald-400">
+                  <span className="h-2.5 w-2.5 rounded-full bg-emerald-500" />
+                  {inquiryResults.availableCount} available
+                </span>
+                <span className="flex items-center gap-1.5 text-red-600 dark:text-red-400">
+                  <span className="h-2.5 w-2.5 rounded-full bg-red-500" />
+                  {inquiryResults.occupiedCount} occupied
+                </span>
+                <span className="flex items-center gap-1.5 text-amber-600 dark:text-amber-400">
+                  <span className="h-2.5 w-2.5 rounded-full bg-amber-500" />
+                  {inquiryResults.blockedCount} blocked
+                </span>
+              </div>
+              <div className="flex max-h-24 flex-wrap items-center justify-center gap-1.5 overflow-y-auto">
+                {inquiryResults.rows.map((row) => (
+                  <span
+                    key={String(row.unit?.id)}
+                    className={cn(
+                      "rounded-full border px-2 py-0.5 text-[10px] font-semibold",
+                      row.available
+                        ? "border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-500/40 dark:bg-emerald-500/15 dark:text-emerald-300"
+                        : "border-red-300 bg-red-50 text-red-700 dark:border-red-500/40 dark:bg-red-500/15 dark:text-red-300",
+                    )}
+                  >
+                    {row.unit?.unitNumber || row.unit?.name || "Unit"}:{" "}
+                    {row.available
+                      ? "Available"
+                      : row.blocked > 0
+                        ? "Blocked"
+                        : "Occupied"}
+                  </span>
+                ))}
+              </div>
+            </div>
           )}
         </div>
       )}
 
       {!isFullScreen && (
-        <div className="rounded-2xl border border-[var(--border)] bg-[hsl(var(--bg-surface))] px-4 py-3 shadow-sm">
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="rounded-2xl border border-[var(--border)] bg-[hsl(var(--bg-surface))] px-3 py-2.5 shadow-sm">
+          <div className="grid gap-2.5 sm:grid-cols-2 lg:grid-cols-4">
             {[
               ["Checked In", operationsSummary["checked-in"], "#7c3aed"],
               [
@@ -2664,7 +3605,7 @@ export default function CalendarClient() {
             ].map(([label, count, color]) => (
               <div
                 key={String(label)}
-                className="flex items-center gap-3 rounded-xl bg-[hsl(var(--bg-primary))] px-3 py-2"
+                className="flex items-center gap-2.5 rounded-xl bg-[hsl(var(--bg-primary))] px-3 py-1.5"
               >
                 <span
                   className="h-2.5 w-2.5 rounded-full"
@@ -2679,7 +3620,7 @@ export default function CalendarClient() {
               </div>
             ))}
           </div>
-          <div className="mt-3 flex flex-wrap items-center justify-center gap-2 text-xs text-[hsl(var(--text-secondary))]">
+          <div className="mt-2 flex flex-wrap items-center justify-center gap-2 text-xs text-[hsl(var(--text-secondary))]">
             <span className="font-semibold text-[hsl(var(--text-primary))]">
               Real-Time Monitor: {formatOperationsTime(clockNow)} ·{" "}
               {clockNow.toLocaleDateString(undefined, {
@@ -2707,7 +3648,7 @@ export default function CalendarClient() {
         selectedRanges={selectedRanges}
         bookingDraft={bookingDraft}
         agents={agents}
-        saving={saving}
+        saving={saving || imageSaving}
         onSave={handleSaveSelection}
         updateDraft={updateDraft}
         setBookingDraft={setBookingDraft}
@@ -2723,19 +3664,6 @@ export default function CalendarClient() {
         getRangeAutoAmount={getRangeAutoAmount}
       />
 
-      <CalendarBookingPanel
-        booking={operationsBooking}
-        unit={operationsBooking ? getBookingUnit(operationsBooking) : null}
-        now={clockNow}
-        onOpenChange={(open) => {
-          if (!open) setOperationsBooking(null);
-        }}
-        onOpenBooking={() => {
-          setDetailsBooking(operationsBooking);
-          setOperationsBooking(null);
-        }}
-      />
-
       <BookingDetailsDialog
         open={Boolean(detailsBooking)}
         onOpenChange={(open) => {
@@ -2745,7 +3673,7 @@ export default function CalendarClient() {
         setDetailsBooking={setDetailsBooking}
         agents={agents}
         units={units}
-        saving={saving}
+        saving={saving || imageSaving}
         onSave={handleSaveDetailsBooking}
         onSaveSnapshot={handleSaveDetailsSnapshot}
         onCopyLetter={handleCopyDetailsAuthorizationLetter}
@@ -2764,139 +3692,69 @@ function getResponsiveContent(
   booking: any,
   span: number,
   dayWidth: string | undefined,
-  isFullScreen: boolean,
-  calendarZoom: number,
-  paymentStatus: { label: string; color: string; key: string },
-  pillStatus: { label: string; color: string; key: string },
-  unitColor: string,
+  _isFullScreen: boolean,
+  _calendarZoom: number,
+  _paymentStatus: { label: string; color: string; key: string },
+  _pillStatus: { label: string; color: string; key: string },
+  _unitColor: string,
   displayGuestName: (b: any) => string,
 ) {
   const baseDayWidth =
     typeof dayWidth === "string" ? parseInt(dayWidth) || 144 : 144;
-  const width = isFullScreen
-    ? (span || 1) * baseDayWidth * calendarZoom
-    : span * 144;
+  // `dayWidth` is already the rendered (zoomed) width. This is used only to
+  // choose a readable content density; it must not alter the bar itself.
+  const width = (span || 1) * baseDayWidth;
   const guestName = displayGuestName(booking);
-  const bookingId = booking?.id || "";
   const initials = guestName
     .split(" ")
     .map((w: string) => w[0])
     .join("")
     .slice(0, 2)
     .toUpperCase();
+  const statusText = getBookingLabel(booking);
 
   if (width <= 90) {
     return (
-      <div className="flex h-full w-full items-center justify-center gap-0.5 px-0.5">
-        <span className="text-[10px] font-bold leading-none text-[hsl(var(--text-primary))]">
+      <div
+        className="flex h-full w-full items-center justify-center px-0.5"
+        aria-label={`${guestName}${statusText ? ` — ${statusText}` : ""}`}
+      >
+        <span className="text-[11px] font-bold leading-none text-white">
           {initials}
         </span>
-        <div className="flex shrink-0 items-center gap-0.5 ml-0.5">
-          <span
-            className="h-1 w-1 shrink-0 rounded-full"
-            style={{ backgroundColor: paymentStatus.color }}
-          />
-          <span
-            className="h-1 w-1 shrink-0 rounded-full"
-            style={{ backgroundColor: pillStatus.color }}
-          />
-        </div>
       </div>
     );
   }
 
-  if (width <= 180) {
+  if (width <= 150) {
     return (
-      <div className="flex h-full w-full flex-col items-start justify-center gap-0 overflow-hidden px-1.5">
-        <span className="min-w-0 w-full truncate whitespace-nowrap overflow-hidden text-ellipsis text-[10px] font-semibold leading-tight text-[hsl(var(--text-primary))]">
+      <div
+        className="flex h-full w-full items-center overflow-hidden px-1.5"
+        aria-label={`${guestName}${statusText ? ` — ${statusText}` : ""}`}
+      >
+        <UserRound className="mr-1.5 h-3.5 w-3.5 shrink-0 text-white/90" />
+        <span className="min-w-0 flex-1 truncate whitespace-nowrap text-left text-[11px] font-bold leading-tight text-white">
           {guestName}
         </span>
-        <div className="flex items-center gap-0.5 mt-0.5">
-          <span
-            className="h-1 w-1 shrink-0 rounded-full"
-            style={{ backgroundColor: paymentStatus.color }}
-          />
-          <span
-            className="text-[9px] font-medium uppercase tracking-wider"
-            style={{ color: paymentStatus.color }}
-          >
-            {paymentStatus.label}
-          </span>
-          <span
-            className="h-1 w-1 shrink-0 rounded-full ml-0.5"
-            style={{ backgroundColor: pillStatus.color }}
-          />
-          <span
-            className="text-[9px] font-medium uppercase tracking-wider"
-            style={{ color: pillStatus.color }}
-          >
-            {pillStatus.label}
-          </span>
-        </div>
-      </div>
-    );
-  }
-
-  if (width <= 320) {
-    return (
-      <div className="flex h-full w-full flex-col items-start justify-center gap-0 overflow-hidden px-2">
-        <span className="min-w-0 w-full truncate whitespace-nowrap overflow-hidden text-ellipsis text-[10px] font-semibold leading-tight text-[hsl(var(--text-primary))]">
-          {guestName}
-        </span>
-        <div className="flex items-center gap-0.5 mt-0.5">
-          <span
-            className="h-1 w-1 shrink-0 rounded-full"
-            style={{ backgroundColor: paymentStatus.color }}
-          />
-          <span
-            className="text-[9px] font-medium uppercase tracking-wider"
-            style={{ color: paymentStatus.color }}
-          >
-            {paymentStatus.label}
-          </span>
-          <span
-            className="h-1 w-1 shrink-0 rounded-full ml-0.5"
-            style={{ backgroundColor: pillStatus.color }}
-          />
-          <span
-            className="text-[9px] font-medium uppercase tracking-wider"
-            style={{ color: pillStatus.color }}
-          >
-            {pillStatus.label}
-          </span>
-        </div>
       </div>
     );
   }
 
   return (
-    <div className="flex h-full w-full flex-col items-start justify-center gap-0 overflow-hidden px-2">
-      <div className="flex items-center gap-1.5 min-w-0 w-full">
-        <span className="min-w-0 w-full truncate whitespace-nowrap overflow-hidden text-ellipsis text-[11px] font-semibold leading-tight text-[hsl(var(--text-primary))]">
+    <div
+      className="flex h-full w-full items-center overflow-hidden px-1.5"
+      aria-label={`${guestName}${statusText ? ` — ${statusText}` : ""}`}
+    >
+      <UserRound className="mr-1.5 h-4 w-4 shrink-0 text-white/90" />
+      <div className="min-w-0 flex-1 leading-tight">
+        <p className="truncate whitespace-nowrap text-left text-[11px] font-bold text-white">
           {guestName}
-        </span>
-      </div>
-      <div className="flex items-center gap-0.5 mt-0.5">
-        <span
-          className="h-1 w-1 shrink-0 rounded-full"
-          style={{ backgroundColor: paymentStatus.color }}
-        />
-        <span
-          className="text-[9px] font-medium uppercase tracking-wider"
-          style={{ color: paymentStatus.color }}
-        >
-          {paymentStatus.label}
-        </span>
-        <span
-          className="h-1 w-1 shrink-0 rounded-full ml-0.5"
-          style={{ backgroundColor: pillStatus.color }}
-        />
-        <span
-          className="text-[9px] font-medium uppercase tracking-wider"
-          style={{ color: pillStatus.color }}
-        >
-          {pillStatus.label}
-        </span>
+        </p>
+        {statusText && (
+          <p className="mt-0.5 truncate whitespace-nowrap text-left text-[8px] font-semibold uppercase tracking-[0.04em] text-white/85">
+            {statusText}
+          </p>
+        )}
       </div>
     </div>
   );
@@ -2909,6 +3767,7 @@ const ReservationBar = React.memo(function ReservationBar({
   unitColor,
   paymentStatus,
   pillStatus,
+  bookingLabel: _bookingLabel,
   isFullScreen,
   calendarZoom,
   clippedStart = false,
@@ -2921,22 +3780,15 @@ const ReservationBar = React.memo(function ReservationBar({
   unitColor: string;
   paymentStatus: { label: string; color: string; key: string };
   pillStatus: { label: string; color: string; key: string };
+  bookingLabel: BookingLabel;
   isFullScreen: boolean;
   calendarZoom: number;
   clippedStart?: boolean;
   clippedEnd?: boolean;
   selectedBookingIds?: string[];
 }) {
-  const statusBg =
-    pillStatus.key === "upcoming"
-      ? "bg-blue-100/90 text-blue-800 dark:bg-blue-500/25 dark:text-blue-200 border-blue-300 dark:border-blue-500/30"
-      : pillStatus.key === "checked-in"
-        ? "bg-violet-100/90 text-violet-800 dark:bg-violet-500/25 dark:text-violet-200 border-violet-300 dark:border-violet-500/30"
-        : pillStatus.key === "due-for-checkout"
-          ? "bg-orange-100/90 text-orange-800 dark:bg-orange-500/25 dark:text-orange-200 border-orange-300 dark:border-orange-500/30"
-          : pillStatus.key === "checked-out"
-            ? "bg-slate-200/90 text-slate-700 dark:bg-slate-500/20 dark:text-slate-300 border-slate-300 dark:border-slate-500/20"
-            : "bg-slate-200/90 text-slate-700 dark:bg-slate-500/20 dark:text-slate-300 border-slate-300 dark:border-slate-500/20";
+  const barBackgroundColor = unitColor;
+  const barBorderColor = darkenHexColor(unitColor, 0.18);
 
   const barBorderRadius = cn(
     !clippedStart && "rounded-l-lg",
@@ -2965,22 +3817,21 @@ const ReservationBar = React.memo(function ReservationBar({
   return (
     <div
       className={cn(
-        "pointer-events-none flex h-full w-full flex-col items-start justify-center gap-0 overflow-hidden rounded-lg border px-2 py-1.5 shadow-none",
-        statusBg,
+        "pointer-events-none flex h-full w-full flex-col items-start justify-center gap-0 overflow-hidden rounded-md border px-1.5 py-1 text-white shadow-none",
         barBorderRadius,
-        isLongStay && "ring-2 ring-offset-1 ring-[var(--accent)]/40",
-        isSelected && "ring-2 ring-orange-400",
+        isLongStay && "ring-2 ring-offset-1 ring-white/70",
+        isSelected && "ring-2 ring-orange-300",
       )}
       style={{
+        backgroundColor: barBackgroundColor,
         borderLeft: `${isLongStay ? 6 : 4}px solid ${unitColor}`,
-        borderTop: `1px solid ${unitColor}30`,
-        borderRight: `1px solid ${unitColor}20`,
-        borderBottom: `1px solid ${unitColor}30`,
-        backgroundColor: isLongStay ? `${unitColor}12` : undefined,
+        borderTop: `1px solid ${barBorderColor}`,
+        borderRight: `1px solid ${barBorderColor}`,
+        borderBottom: `1px solid ${barBorderColor}`,
       }}
     >
       {isLongStay && (
-        <span className="absolute right-1 top-1 rounded-full bg-[hsl(var(--accent))]/15 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider text-[hsl(var(--accent))]">
+        <span className="absolute right-1 top-0.5 rounded-full bg-white/25 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider text-white">
           Long Stay
         </span>
       )}

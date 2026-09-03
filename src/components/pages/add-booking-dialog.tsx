@@ -13,6 +13,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { ImageDown, Clipboard, Loader2, CalendarPlus, X } from "lucide-react";
+import {
+  bookingSourceOptions,
+  getBookingSourceColor,
+  getBookingSourceLabel,
+} from "@/lib/booking-source";
 
 // Keep the booking form separate from the calendar orchestration component.
 
@@ -23,6 +28,8 @@ export type BookingDraft = {
   guestEmail: string;
   agentId: string;
   agentName: string;
+  bookingSource: string;
+  bookingLabel: string;
   bookingDate: string;
   adults: number;
   children: number;
@@ -74,7 +81,7 @@ interface AddBookingDialogProps {
   bookingDraft: BookingDraft;
   agents: any[];
   saving: boolean;
-  onSave: (event: React.FormEvent) => void;
+  onSave: (event: React.FormEvent, draft: BookingDraft) => void;
   updateDraft: (field: keyof BookingDraft, value: any) => void;
   setBookingDraft: React.Dispatch<React.SetStateAction<BookingDraft>>;
   setDraftNested: (path: string, value: any) => void;
@@ -104,13 +111,13 @@ export function AddBookingDialog({
   open,
   onOpenChange,
   selectedRanges,
-  bookingDraft,
+  bookingDraft: initialBookingDraft,
   agents,
   saving,
   onSave,
-  updateDraft,
-  setBookingDraft,
-  setDraftNested,
+  updateDraft: _updateDraft,
+  setBookingDraft: _setBookingDraft,
+  setDraftNested: _setDraftNested,
   onSaveSnapshot,
   onCopyLetters,
   onClearSelection,
@@ -118,8 +125,38 @@ export function AddBookingDialog({
   calendarSnapshotRef,
   getRangeAutoAmount,
 }: AddBookingDialogProps) {
+  // Keep typing state inside the dialog. Updating a name or a note should not
+  // rerender the hundreds of calendar cells behind the modal.
+  const [bookingDraft, setLocalBookingDraft] = React.useState(initialBookingDraft);
+
+  React.useEffect(() => {
+    if (open) setLocalBookingDraft(initialBookingDraft);
+  }, [initialBookingDraft, open]);
+
+  const updateDraft = React.useCallback((field: keyof BookingDraft, value: any) => {
+    setLocalBookingDraft((draft) => ({ ...draft, [field]: value }));
+  }, []);
+  const setBookingDraft: React.Dispatch<React.SetStateAction<BookingDraft>> =
+    React.useCallback((next) => {
+      setLocalBookingDraft((draft) =>
+        typeof next === "function" ? next(draft) : next,
+      );
+    }, []);
+  const setDraftNested = React.useCallback((path: string, value: any) => {
+    setLocalBookingDraft((draft: any) => {
+      const [parent, child] = path.split(".");
+      return { ...draft, [parent]: { ...(draft[parent] || {}), [child]: value } };
+    });
+  }, []);
   const getAgentLabel = (agent: any) =>
     agent?.name || agent?.fullName || agent?.agentName || "Unnamed Agent";
+  const selectedSource = bookingSourceOptions.some(
+    (source) =>
+      source.value.toLowerCase() === String(bookingDraft.bookingSource || "").toLowerCase(),
+  )
+    ? bookingDraft.bookingSource
+    : "N/A";
+  const selectedSourceColor = getBookingSourceColor(selectedSource);
 
   const displayDraftGuestName = () => {
     const draft = bookingDraft as any;
@@ -136,7 +173,7 @@ export function AddBookingDialog({
           <DialogTitle>New Booking from Calendar</DialogTitle>
           <DialogDescription>Selected Calendar Dates</DialogDescription>
         </DialogHeader>
-        <form onSubmit={onSave} className="space-y-4 pt-4">
+        <form onSubmit={(event) => onSave(event, bookingDraft)} className="space-y-4 pt-4">
           <div className="rounded-xl border bg-amber-50/60 p-4">
             <div className="mb-3 flex items-center justify-between gap-3">
               <p className="text-xs font-black uppercase tracking-[0.16em] text-amber-700">
@@ -192,29 +229,68 @@ export function AddBookingDialog({
           </div>
 
           <div className="space-y-1">
+            <Label>Booking Source</Label>
+            <div className="relative">
+              <span
+                aria-hidden="true"
+                className="pointer-events-none absolute left-3 top-1/2 h-2.5 w-2.5 -translate-y-1/2 rounded-full"
+                style={{ backgroundColor: selectedSourceColor }}
+              />
+              <select
+                className="h-11 w-full rounded-lg border border-[hsl(var(--accent))]/60 bg-[hsl(var(--bg-surface))] py-0 pl-8 pr-3 text-sm font-medium text-[hsl(var(--text-primary))] outline-none focus:ring-2 focus:ring-[hsl(var(--accent))]/30"
+                value={selectedSource}
+                onChange={(e) => {
+                  const bookingSource = e.target.value;
+                  setBookingDraft({
+                    ...bookingDraft,
+                    bookingSource,
+                    bookingLabel: getBookingSourceLabel(bookingSource),
+                  });
+                }}
+              >
+                {bookingSourceOptions.map((source) => (
+                  <option key={source.value} value={source.value}>
+                    {source.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div className="space-y-1">
             <Label>Agent</Label>
-            <select
-              className="w-full h-10 border rounded-md px-3"
-              value={bookingDraft.agentId || ""}
-              onChange={(e) => {
-                const agentId = e.target.value;
-                const selectedAgent = (agents as any[]).find(
-                  (a: any) => String(a.id) === String(agentId),
-                );
-                setBookingDraft({
-                  ...bookingDraft,
-                  agentId,
-                  agentName: agentId ? getAgentLabel(selectedAgent) : "",
-                });
-              }}
-            >
-              <option value="">No Agent</option>
-              {(agents as any[]).map((agent: any) => (
-                <option key={agent.id} value={String(agent.id)}>
-                  {getAgentLabel(agent)}
-                </option>
-              ))}
-            </select>
+            <div className="relative">
+              <span
+                aria-hidden="true"
+                className="pointer-events-none absolute left-3 top-1/2 h-2.5 w-2.5 -translate-y-1/2 rounded-full"
+                style={{ backgroundColor: selectedSourceColor }}
+              />
+              <select
+                className="h-11 w-full rounded-lg border border-[hsl(var(--accent))]/60 bg-[hsl(var(--bg-surface))] py-0 pl-8 pr-3 text-sm font-medium text-[hsl(var(--text-primary))] outline-none focus:ring-2 focus:ring-[hsl(var(--accent))]/30"
+                value={bookingDraft.agentId || ""}
+                onChange={(e) => {
+                  const agentId = e.target.value;
+                  const selectedAgent = (agents as any[]).find(
+                    (a: any) => String(a.id) === String(agentId),
+                  );
+                  setBookingDraft({
+                    ...bookingDraft,
+                    agentId,
+                    agentName: agentId ? getAgentLabel(selectedAgent) : "",
+                    ...(agentId && selectedSource === "N/A"
+                      ? { bookingSource: "Agent", bookingLabel: "AGENT" }
+                      : {}),
+                  });
+                }}
+              >
+                <option value="">No Agent</option>
+                {(agents as any[]).map((agent: any) => (
+                  <option key={agent.id} value={String(agent.id)}>
+                    {getAgentLabel(agent)}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
 
           <div className="grid grid-cols-2 gap-4">
@@ -242,7 +318,7 @@ export function AddBookingDialog({
             <Textarea
               value={bookingDraft.notes || ""}
               onChange={(e) => updateDraft("notes", e.target.value)}
-              className="min-h-[90px]"
+              className="min-h-[112px] resize-y border-[var(--border)] bg-[hsl(var(--bg-surface))] text-[hsl(var(--text-primary))] placeholder:text-[hsl(var(--text-secondary))]"
             />
           </div>
 

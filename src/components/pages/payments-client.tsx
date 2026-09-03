@@ -52,6 +52,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useToast } from "@/hooks/use-toast";
 import { useUserRole } from "@/hooks/use-user-role";
+import { getBookingSourceColor } from "@/lib/booking-source";
 import { canManageOperations } from "@/auth/roles";
 import {
   formatCurrency,
@@ -183,15 +184,15 @@ export default function PaymentsClient() {
     const value = rawReference.toLowerCase();
     // Don't surface a raw Firestore/Auth ID as the "reference".
     if (looksLikeFirestoreId(rawReference)) {
-      return { label: "Unknown", icon: "" };
+      return { label: "Unknown", icon: "", color: getBookingSourceColor("N/A") };
     }
     if (value.includes("airbnb"))
-      return { label: "Airbnb", icon: "/images/airbnb_logo.png" };
+      return { label: "Airbnb", icon: "/images/airbnb_logo.png", color: getBookingSourceColor("Airbnb") };
     if (value.includes("booking"))
-      return { label: "Booking.com", icon: "/images/booking_logo.png" };
+      return { label: "Booking.com", icon: "/images/booking_logo.png", color: getBookingSourceColor("Booking.com") };
     if (value.includes("facebook"))
-      return { label: "Facebook Page", icon: "/images/facebook_logo.png" };
-    return { label: rawReference || "Unknown", icon: "" };
+      return { label: "Facebook Page", icon: "/images/facebook_logo.png", color: getBookingSourceColor("Facebook Page") };
+    return { label: rawReference || "Unknown", icon: "", color: getBookingSourceColor(rawReference) };
   };
 
   // Enrich each row with display helpers used by sorting + rendering.
@@ -846,12 +847,13 @@ export default function PaymentsClient() {
   // Render the Payment Method cell. When the booking source matches a known
   // OTA (Airbnb / Booking.com / Facebook), show its logo alongside the method.
   const renderMethodLabel = (row: {
-    source: { label: string; icon: string };
+    source: { label: string; icon: string; color: string };
     method: string;
   }) => {
     if (row.source.icon) {
       return (
         <span className="inline-flex items-center gap-1.5">
+          <span aria-hidden="true" className="h-2 w-2 rounded-full" style={{ backgroundColor: row.source.color }} />
           <img
             src={row.source.icon}
             alt={row.source.label}
@@ -863,6 +865,7 @@ export default function PaymentsClient() {
     }
     return (
       <span className="inline-flex items-center gap-1.5 text-xs font-medium">
+        <span aria-hidden="true" className="h-2 w-2 rounded-full" style={{ backgroundColor: row.source.color }} />
         {row.method === "GCASH" ? (
           <span className="text-[10px] font-bold uppercase text-emerald-600">
             GCash

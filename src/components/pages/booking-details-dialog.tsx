@@ -27,8 +27,15 @@ import {
   getSecurityDepositDate,
   formatReadableDate,
 } from "@/lib/utils-app";
+import {
+  bookingSourceOptions,
+  getBookingSourceColor,
+  getBookingSourceDisplayName,
+  getBookingSourceLabel,
+} from "@/lib/booking-source";
 
-// Keep booking details and document actions separate from calendar state.
+
+// Handles booking details and document generation.
 
 interface BookingDetailsDialogProps {
   open: boolean;
@@ -136,8 +143,7 @@ const numberToWords = (amount: number) => {
   return cents ? `${pesos} and ${cents}/100` : `${pesos} Only`;
 };
 
-// NOTE: placeholder numbering scheme (MPS-{year}-{last 4 of booking id}).
-// Swap for a real sequential counter once one exists server-side.
+// Temporary document numbering scheme; replace with server-side counter when available.
 const buildDocumentNumber = (booking: any, prefix: string) => {
   const year = new Date().getFullYear();
   const seq = String(booking?.id || "0000")
@@ -274,7 +280,7 @@ const SignatureBlock = () => (
       }}
     >
       <img
-        src="/signature-with-name.png"
+        src="/rep_sig.png"
         alt="Authorized Representative Signature"
         style={{
           height: "220px",
@@ -330,6 +336,23 @@ export function BookingDetailsDialog({
 }: BookingDetailsDialogProps) {
   const getAgentLabel = (agent: any) =>
     agent?.name || agent?.fullName || agent?.agentName || "Unnamed Agent";
+  const selectedSource = bookingSourceOptions.some(
+    (source) =>
+      source.value.toLowerCase() ===
+      String(
+        detailsBooking?.bookingSource ||
+          detailsBooking?.source ||
+          detailsBooking?.channel ||
+          "",
+      ).toLowerCase(),
+  )
+    ? getBookingSourceDisplayName(
+        detailsBooking?.bookingSource ||
+          detailsBooking?.source ||
+          detailsBooking?.channel,
+      )
+    : "N/A";
+  const selectedSourceColor = getBookingSourceColor(selectedSource);
 
   const toComparableUnitValues = (unit: any) =>
     [unit?.id, unit?.unitNumber, unit?.name]
@@ -348,8 +371,9 @@ export function BookingDetailsDialog({
     );
   };
 
-  // Always load the latest security deposit data directly from Firestore so the
-  // dialog reflects the canonical, synchronized security-deposits collection.
+
+
+  // Syncs security deposit data with canonical collection.
   const liveDepositSummary = useMemo(() => {
     if (!detailsBooking?.id || !Array.isArray(securityDeposits)) return null;
     const map = buildBookingDepositSummary(securityDeposits);
@@ -502,6 +526,14 @@ export function BookingDetailsDialog({
                     : "UNPAID"}
                 </span>
               </div>
+              <div className="flex items-center gap-2 text-xs font-semibold text-gray-600">
+                <span
+                  aria-hidden="true"
+                  className="h-2.5 w-2.5 rounded-full"
+                  style={{ backgroundColor: selectedSourceColor }}
+                />
+                <span>Source: {selectedSource}</span>
+              </div>
               <div className="h-px bg-gray-100 my-1" />
               <div className="grid grid-cols-2 gap-4 text-sm mt-1">
                 <div>
@@ -562,29 +594,68 @@ export function BookingDetailsDialog({
               </div>
 
               <div className="space-y-1">
+                <Label>Booking Source</Label>
+                <div className="relative">
+                  <span
+                    aria-hidden="true"
+                    className="pointer-events-none absolute left-3 top-1/2 h-2.5 w-2.5 -translate-y-1/2 rounded-full"
+                    style={{ backgroundColor: selectedSourceColor }}
+                  />
+                  <select
+                    className="w-full h-10 border rounded-md py-0 pl-8 pr-3"
+                    value={selectedSource}
+                    onChange={(e) => {
+                      const bookingSource = e.target.value;
+                      setDetailsBooking({
+                        ...detailsBooking,
+                        bookingSource,
+                        bookingLabel: getBookingSourceLabel(bookingSource),
+                      });
+                    }}
+                  >
+                    {bookingSourceOptions.map((source) => (
+                      <option key={source.value} value={source.value}>
+                        {source.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div className="space-y-1">
                 <Label>Agent</Label>
-                <select
-                  className="w-full h-10 border rounded-md px-3"
-                  value={detailsBooking?.agentId || ""}
-                  onChange={(e) => {
-                    const agentId = e.target.value;
-                    const selectedAgent = (agents as any[]).find(
-                      (a: any) => String(a.id) === String(agentId),
-                    );
-                    setDetailsBooking({
-                      ...detailsBooking,
-                      agentId,
-                      agentName: agentId ? getAgentLabel(selectedAgent) : "",
-                    });
-                  }}
-                >
-                  <option value="">No Agent</option>
-                  {(agents as any[]).map((agent: any) => (
-                    <option key={agent.id} value={String(agent.id)}>
-                      {getAgentLabel(agent)}
-                    </option>
-                  ))}
-                </select>
+                <div className="relative">
+                  <span
+                    aria-hidden="true"
+                    className="pointer-events-none absolute left-3 top-1/2 h-2.5 w-2.5 -translate-y-1/2 rounded-full"
+                    style={{ backgroundColor: selectedSourceColor }}
+                  />
+                  <select
+                    className="w-full h-10 border rounded-md py-0 pl-8 pr-3"
+                    value={detailsBooking?.agentId || ""}
+                    onChange={(e) => {
+                      const agentId = e.target.value;
+                      const selectedAgent = (agents as any[]).find(
+                        (a: any) => String(a.id) === String(agentId),
+                      );
+                      setDetailsBooking({
+                        ...detailsBooking,
+                        agentId,
+                        agentName: agentId ? getAgentLabel(selectedAgent) : "",
+                        ...(agentId && selectedSource === "N/A"
+                          ? { bookingSource: "Agent", bookingLabel: "AGENT" }
+                          : {}),
+                      });
+                    }}
+                  >
+                    <option value="">No Agent</option>
+                    {(agents as any[]).map((agent: any) => (
+                      <option key={agent.id} value={String(agent.id)}>
+                        {getAgentLabel(agent)}
+                      </option>
+                    ))}
+                  </select>
+                </div>
               </div>
 
               <div className="grid grid-cols-2 gap-4">
@@ -1229,7 +1300,7 @@ export function BookingDetailsDialog({
                     color: "black",
                   }}
                 >
-                  {/* Header */}
+
                   <div
                     style={{
                       display: "flex",
@@ -1301,7 +1372,7 @@ export function BookingDetailsDialog({
                     📋 QUOTATION
                   </h1>
 
-                  {/* Document Info */}
+
                   <div
                     style={{
                       display: "grid",
@@ -1339,7 +1410,7 @@ export function BookingDetailsDialog({
                     </div>
                   </div>
 
-                  {/* Table */}
+
                   <table
                     style={{
                       width: "100%",
@@ -1456,7 +1527,7 @@ export function BookingDetailsDialog({
                     </tbody>
                   </table>
 
-                  {/* Total */}
+
                   <div
                     style={{
                       display: "flex",
@@ -1478,7 +1549,7 @@ export function BookingDetailsDialog({
                     </p>
                   </div>
 
-                  {/* Amount in words and terms */}
+
                   <p
                     style={{
                       fontSize: "12px",
@@ -1520,7 +1591,7 @@ export function BookingDetailsDialog({
                     color: "black",
                   }}
                 >
-                  {/* Header */}
+
                   <div
                     style={{
                       display: "flex",
@@ -1592,7 +1663,7 @@ export function BookingDetailsDialog({
                     📊 STATEMENT OF ACCOUNT
                   </h1>
 
-                  {/* Document Info - 2 columns */}
+
                   <div
                     style={{
                       display: "grid",
@@ -1624,7 +1695,7 @@ export function BookingDetailsDialog({
                     </div>
                   </div>
 
-                  {/* Project and Location */}
+
                   <div
                     style={{
                       display: "grid",
@@ -1668,7 +1739,7 @@ export function BookingDetailsDialog({
                     </div>
                   </div>
 
-                  {/* Table */}
+
                   <table
                     style={{
                       width: "100%",
@@ -1743,7 +1814,7 @@ export function BookingDetailsDialog({
                     </tbody>
                   </table>
 
-                  {/* Payment Summary */}
+
                   <div
                     style={{
                       borderTop: "2px solid black",
@@ -1792,7 +1863,7 @@ export function BookingDetailsDialog({
                     </div>
                   </div>
 
-                  {/* Amount in words and terms */}
+
                   <p
                     style={{
                       fontSize: "12px",
