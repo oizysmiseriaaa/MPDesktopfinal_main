@@ -5,12 +5,19 @@ import { check } from "@tauri-apps/plugin-updater";
 import { toast } from "@/hooks/use-toast";
 
 export function AppUpdater() {
-  const [checking, setChecking] = useState(false);
+  const [, setChecking] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
 
     async function checkForUpdates() {
+      // The updater plugin only exists in the packaged Tauri desktop app.
+      // Skipping browser/dev runtimes also prevents a failed update endpoint
+      // from becoming a Next.js development error overlay.
+      if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) {
+        return;
+      }
+
       try {
         setChecking(true);
 
@@ -53,7 +60,9 @@ export function AppUpdater() {
           ),
         });
       } catch (error) {
-        console.error("Update check failed:", error);
+        // Update checks are optional. A missing release, unavailable network,
+        // or invalid updater manifest must not interrupt normal app usage.
+        void error;
       } finally {
         if (!cancelled) {
           setChecking(false);

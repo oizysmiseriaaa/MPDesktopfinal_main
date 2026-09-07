@@ -83,6 +83,7 @@ import {
   getBookingSourceLabel,
   type BookingSourceLabel,
 } from "@/lib/booking-source";
+import { getUnitBasePrice } from "@/lib/unit-pricing";
 
 const unitColors = [
   "#2563EB",
@@ -492,7 +493,10 @@ export default function CalendarClient() {
   }, []);
 
   useEffect(() => {
-    const interval = window.setInterval(() => setClockNow(new Date()), 1000);
+    // The calendar is a large view; a one-second state update rerendered the
+    // entire grid even when no booking state could change. Ten seconds keeps
+    // the operations monitor live without making the grid a render hotspot.
+    const interval = window.setInterval(() => setClockNow(new Date()), 10_000);
     return () => window.clearInterval(interval);
   }, []);
 
@@ -1820,7 +1824,7 @@ export default function CalendarClient() {
     const unit = (units as any[]).find(
       (u) => String(u.id) === String(bookingData.unitId),
     );
-    const baseRate = toNumber(unit?.rate, 0);
+    const baseRate = getUnitBasePrice(unit);
     const commissionAmount = Math.max(
       0,
       bookingData.totalAmount - baseRate * nights,
@@ -2103,8 +2107,8 @@ export default function CalendarClient() {
           .replace(/[\\/:*?"<>|]+/g, "_") || "booking";
       const bookingDate =
         toDateInput(getBookingDateValue(detailsBooking)) || todayDateInput();
-      const path = `Bookings/${bookingDate.replace(/-/g, "")}-${guestName}.png`;
-      await mkdir("Bookings", {
+      const path = `ManilaPrime/Bookings/${bookingDate.replace(/-/g, "")}-${guestName}.png`;
+      await mkdir("ManilaPrime/Bookings", {
         baseDir: BaseDirectory.Desktop,
         recursive: true,
       });

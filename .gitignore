@@ -24,6 +24,9 @@
 .DS_Store
 *.pem
 
+# Local representative signature used only when generating customer documents.
+/public/rep_sig.png
+
 # debug
 npm-debug.log*
 yarn-debug.log*

@@ -109,13 +109,15 @@ exports.propertiesRouter.post("/unit", async (req, res) => {
       req,
       docRef.id,
     );
-    const newUnit = {
+    const pricing = (0, route_helpers_1.normalizeUnitPricing)(body);
+    const newUnit = (0, route_helpers_1.stripUndefinedFields)({
       ...body,
+      ...pricing,
       calendars: {
         ...calendars,
         direct: directCalendarUrl,
       },
-    };
+    });
     await docRef.set(newUnit);
     const discordMessage = `
 -----------------------------
@@ -144,7 +146,16 @@ exports.propertiesRouter.put("/unit/:unitId", async (req, res) => {
     const adminDb = (0, route_helpers_1.getDb)();
     const body = req.body ?? {};
     const unitId = req.params.unitId;
-    const unitData = { ...body };
+    const ref = adminDb.collection("units").doc(unitId);
+    const beforeSnap = await ref.get();
+    const before = beforeSnap.data();
+    if (!beforeSnap.exists)
+      return res.status(404).json({ error: "Unit not found" });
+    const pricing = (0, route_helpers_1.normalizeUnitPricing)(body, before);
+    const unitData = (0, route_helpers_1.stripUndefinedFields)({
+      ...body,
+      ...pricing,
+    });
     const directCalendarUrl = (0, route_helpers_1.getDirectCalendarUrl)(
       req,
       unitId,
@@ -159,11 +170,6 @@ exports.propertiesRouter.put("/unit/:unitId", async (req, res) => {
         direct: directCalendarUrl,
       };
     }
-    const ref = adminDb.collection("units").doc(unitId);
-    const beforeSnap = await ref.get();
-    const before = beforeSnap.data();
-    if (!beforeSnap.exists)
-      return res.status(404).json({ error: "Unit not found" });
     if (!("calendars" in body)) {
       unitData.calendars = {
         ...(before?.calendars ?? {}),
@@ -282,6 +288,21 @@ exports.propertiesRouter.get("/ical/:unitId", async (req, res) => {
         .status(ical_generator_1.ICalEventStatus.CONFIRMED)
         .transparency(ical_generator_1.ICalEventTransparency.OPAQUE);
     });
+    // Publish the same one-time winter closure in each existing direct iCal
+    // feed. This creates no Firestore booking and expires after Jan 31, 2027.
+    calendar
+      .createEvent({
+        start: new Date("2026-12-01T00:00:00Z"),
+        end: new Date("2027-02-01T00:00:00Z"),
+      })
+      .id(`calendar-closure-winter-2026-${unitId}`)
+      .uid(`calendar-closure-winter-2026-${unitId}@yourdomain.com`)
+      .summary("Unavailable")
+      .description(
+        "Property unavailable from December 1, 2026 through January 31, 2027.",
+      )
+      .status(ical_generator_1.ICalEventStatus.CONFIRMED)
+      .transparency(ical_generator_1.ICalEventTransparency.OPAQUE);
     res.setHeader("Content-Type", "text/calendar; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader(
@@ -306,7 +327,10 @@ exports.propertiesRouter.get("/expenses", async (req, res) => {
 exports.propertiesRouter.post("/expense", async (req, res) => {
   try {
     const adminDb = (0, route_helpers_1.getDb)();
-    const normalized = (0, route_helpers_1.normalizeExpenseInput)(req.body);
+    const requestBody = (0, route_helpers_1.stripUndefinedFields)(
+      req.body ?? {},
+    );
+    const normalized = (0, route_helpers_1.normalizeExpenseInput)(requestBody);
     if (
       normalized.amountMode === "per_unit" &&
       normalized.unitIds.length === 0
@@ -321,17 +345,17 @@ exports.propertiesRouter.post("/expense", async (req, res) => {
       normalized,
       totals,
       {
-        createdAt: req.body?.createdAt || new Date().toISOString(),
-        ...(req.body?.updatedAt ? { updatedAt: req.body.updatedAt } : {}),
+        createdAt: requestBody.createdAt || new Date().toISOString(),
+        ...(requestBody.updatedAt ? { updatedAt: requestBody.updatedAt } : {}),
       },
     );
     // Use deterministic ID if provided (for idempotency), otherwise auto-generate
-    if (req.body?.id) {
+    if (requestBody.id) {
       await adminDb
         .collection("expenses")
-        .doc(req.body.id)
+        .doc(requestBody.id)
         .set(docData, { merge: true });
-      return res.status(201).json({ id: req.body.id });
+      return res.status(201).json({ id: requestBody.id });
     } else {
       const docRef = await adminDb.collection("expenses").add(docData);
       return res.status(201).json({ id: docRef.id });
@@ -351,7 +375,10 @@ exports.propertiesRouter.put("/expense/:expenseId", async (req, res) => {
     if (!beforeSnap.exists)
       return res.status(404).json({ error: "Expense not found" });
     const before = beforeSnap.data();
-    const merged = { ...before, ...req.body };
+    const requestBody = (0, route_helpers_1.stripUndefinedFields)(
+      req.body ?? {},
+    );
+    const merged = { ...before, ...requestBody };
     const normalized = (0, route_helpers_1.normalizeExpenseInput)(merged);
     if (
       normalized.amountMode === "per_unit" &&
@@ -367,7 +394,7 @@ exports.propertiesRouter.put("/expense/:expenseId", async (req, res) => {
       normalized,
       totals,
       {
-        updatedAt: req.body?.updatedAt || new Date().toISOString(),
+        updatedAt: requestBody.updatedAt || new Date().toISOString(),
       },
     );
     await ref.update(docData);

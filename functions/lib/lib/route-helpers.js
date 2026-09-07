@@ -79,6 +79,10 @@ exports.getBaseUrl = getBaseUrl;
 exports.getDirectCalendarUrl = getDirectCalendarUrl;
 exports.sanitizeCalendars = sanitizeCalendars;
 exports.toNumber = toNumber;
+exports.normalizeUnitPricing = normalizeUnitPricing;
+exports.getUnitBasePrice = getUnitBasePrice;
+exports.getUnitMarkup = getUnitMarkup;
+exports.getUnitFinalPrice = getUnitFinalPrice;
 exports.clampInt = clampInt;
 exports.normalizeExpenseInput = normalizeExpenseInput;
 exports.computeExpenseTotals = computeExpenseTotals;
@@ -377,10 +381,14 @@ function isLegacySheetBookingPlaceholder(booking) {
   const id = String(booking?.id || booking?.bookingId || "");
   if (!id.startsWith("sheet-booking-") || booking?.sourceRow) return false;
   const normalize = (value) =>
-    String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
+    String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, " ");
   const guest = normalize(
-    [booking?.guestFirstName, booking?.guestLastName].filter(Boolean).join(" ") ||
-      booking?.guestName,
+    [booking?.guestFirstName, booking?.guestLastName]
+      .filter(Boolean)
+      .join(" ") || booking?.guestName,
   );
   return Boolean(
     guest && guest === normalize(booking?.unitName) && !booking?.notes,
@@ -596,6 +604,32 @@ function toNumber(v) {
   const normalized = raw.replace(/[₱$€£,\s]/g, "").replace(/[^0-9.+-]/g, "");
   const n = Number(normalized);
   return Number.isFinite(n) ? n : 0;
+}
+function getUnitBasePrice(unit) {
+  return toNumber(unit?.basePrice ?? unit?.rate);
+}
+function getUnitMarkup(unit) {
+  return toNumber(unit?.markup);
+}
+function getUnitFinalPrice(unit) {
+  return Math.max(0, getUnitBasePrice(unit) + getUnitMarkup(unit));
+}
+function normalizeUnitPricing(body, existing = {}) {
+  const hasBasePrice =
+    body?.basePrice !== undefined &&
+    body?.basePrice !== null &&
+    body?.basePrice !== "";
+  const basePrice = hasBasePrice
+    ? toNumber(body.basePrice)
+    : getUnitBasePrice(existing) || toNumber(body?.rate);
+  const markup =
+    body?.markup === undefined || body?.markup === null || body?.markup === ""
+      ? getUnitMarkup(existing)
+      : toNumber(body.markup);
+  if (basePrice < 0 || markup < 0) {
+    throw new Error("Unit base price and markup must be non-negative numbers.");
+  }
+  return { basePrice, markup, rate: getUnitFinalPrice({ basePrice, markup }) };
 }
 function clampInt(n, min, max) {
   const x = parseInt(String(n), 10);
@@ -878,6 +912,7 @@ async function syncLedgerRecord(params) {
   const adminDb = getDb();
   const { collectionName, bookingId, deterministicId, desiredAmount, payload } =
     params;
+  const isBookingPayment = collectionName === "booking-payments";
   const snapshot = await adminDb
     .collection(collectionName)
     .where("bookingId", "==", bookingId)
@@ -890,6 +925,12 @@ async function syncLedgerRecord(params) {
       d.id === deterministicId
     );
   });
+  if (isBookingPayment && desiredAmount > 0 && managedDocs.length === 0) {
+    if (snapshot.docs.length > 0) return snapshot.docs[0].id;
+  }
+  if (isBookingPayment && desiredAmount <= 0) {
+    return managedDocs[0]?.id || snapshot.docs[0]?.id || null;
+  }
   const primaryRef =
     managedDocs.find((d) => d.id === deterministicId)?.ref ??
     managedDocs[0]?.ref ??
@@ -903,7 +944,7 @@ async function syncLedgerRecord(params) {
     return null;
   }
   await primaryRef.set(
-    {
+    stripUndefinedFields({
       ...payload,
       id: primaryRef.id,
       bookingId,
@@ -913,7 +954,7 @@ async function syncLedgerRecord(params) {
       updatedAt: new Date().toISOString(),
       source: "booking-save",
       managedByBooking: true,
-    },
+    }),
     { merge: true },
   );
   return primaryRef.id;

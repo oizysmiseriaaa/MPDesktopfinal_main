@@ -1,0 +1,11 @@
+﻿{
+    "platforms":  {
+                      "windows-x86_64":  {
+                                             "signature":  "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSWDZZVVhwaHF1L01qOGNtdEZIZHlZRzdmNnBMb0RSVHE3QTcyQXkrSTdEclV2c2pKNmJIQU5aSzk3eHJXdzZ1d0x0Zkw1OTVXaExTTkdnWGtwcitEU3Y1dHRFTzNhOFFvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4NDQ5NjU4CWZpbGU6TWFuaWxhIFByaW1lIE1hbmFnZXJfMC4xLjVfeDY0LXNldHVwLmV4ZQp2ViszV2NXalV0UGtrZlVMY0w3bk53bm16RkxPUFlHQTd5SVhtKzYyQTN3dWpDcW9JdloyTmNxOWJOZThKTjB3OTJTN1dXZjVKTTAzUHVUSGh4akFEUT09Cg==",
+                                             "url":  "https://github.com/oizysmiseriaaa/MPDesktopFinal_main/releases/download/v0.1.5/Manila.Prime.Manager_0.1.5_x64-setup.exe"
+                                         }
+                  },
+    "pub_date":  "2026-09-03T15:40:34Z",
+    "version":  "0.1.5",
+    "notes":  "Bug fix release. Fixed expense Firestore save handling."
+}

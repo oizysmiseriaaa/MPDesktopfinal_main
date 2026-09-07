@@ -12,6 +12,7 @@ describe("booking export destinations", () => {
     expect(bookings).toContain(
       "return `ManilaPrime/Bookings/${date}_${unitName}_${identifier}.png`;",
     );
+    expect(bookings).toContain('await mkdir("ManilaPrime/Bookings",');
     expect(bookings).toContain(
       'type === "quotation" ? "ManilaPrime/Quotations" : "ManilaPrime/SOA"',
     );
@@ -25,6 +26,10 @@ describe("booking export destinations", () => {
     const calendar = source("calendar-client.tsx");
 
     expect(calendar).toContain('const folder = "ManilaPrime/Bookings";');
+    expect(calendar).toContain(
+      'const path = `ManilaPrime/Bookings/${bookingDate.replace(/-/g, "")}-${guestName}.png`;',
+    );
+    expect(calendar).toContain('await mkdir("ManilaPrime/Bookings",');
     expect(calendar).toContain(
       'type === "quotation" ? "ManilaPrime/Quotations" : "ManilaPrime/SOA"',
     );

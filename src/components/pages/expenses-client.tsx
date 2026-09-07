@@ -79,30 +79,26 @@ function toNumber(value: any, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-function sanitizeExpensePayload(payload: Record<string, any>) {
-  const sanitizeValue = (value: any): any => {
-    if (value === undefined || value === null) return undefined;
-    if (typeof value === "string" && value.trim() === "") return undefined;
+function sanitizeExpensePayload(payload: Record<string, any>): any {
+  if (payload === undefined || payload === null) return {};
+  if (Array.isArray(payload)) {
+    return payload
+      .map((value) => sanitizeExpensePayload(value as Record<string, any>))
+      .filter((value) => Object.keys(value).length > 0);
+  }
 
-    if (Array.isArray(value)) {
-      return value.map(sanitizeValue).filter((item) => item !== undefined);
-    }
-
+  const sanitized: Record<string, any> = {};
+  Object.entries(payload).forEach(([key, value]) => {
+    if (value === undefined || value === null) return;
+    if (typeof value === "string" && value.trim() === "") return;
     if (typeof value === "object") {
-      const sanitizedObject = Object.fromEntries(
-        Object.entries(value)
-          .map(([key, nestedValue]) => [key, sanitizeValue(nestedValue)])
-          .filter(([, nestedValue]) => nestedValue !== undefined),
-      );
-      return Object.keys(sanitizedObject).length > 0
-        ? sanitizedObject
-        : undefined;
+      const cleaned = sanitizeExpensePayload(value as Record<string, any>);
+      if (Object.keys(cleaned).length > 0) sanitized[key] = cleaned;
+      return;
     }
-
-    return value;
-  };
-
-  return sanitizeValue(payload) ?? {};
+    sanitized[key] = value;
+  });
+  return sanitized;
 }
 
 const UnitCheckboxRow = React.memo(function UnitCheckboxRow({
@@ -770,8 +766,10 @@ export default function ExpensesClient() {
       editingExpense.recurringDay !== null &&
       editingExpense.recurringDay !== ""
     ) {
-      payload.recurringDay = Number(editingExpense.recurringDay);
+      const recurringDay = Number(editingExpense.recurringDay);
+      if (Number.isFinite(recurringDay)) payload.recurringDay = recurringDay;
     }
+    if (frequency !== "recurring") delete payload.recurringDay;
 
     // Only include unitIds/unitId if applicable
     if (unitIds.length > 0) {

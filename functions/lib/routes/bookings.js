@@ -8,6 +8,32 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.bookingsRouter = void 0;
 const express_1 = __importDefault(require("express"));
 const route_helpers_1 = require("../lib/route-helpers");
+const AUG29_BLOCK_DATE = "2026-08-29";
+const WINTER_BLOCK_START_DATE = "2026-12-01";
+const WINTER_BLOCK_END_EXCLUSIVE = "2027-02-01";
+const isAug29ExceptionUnit = (unit) => {
+  const values = [unit?.id, unit?.unitNumber, unit?.name]
+    .filter(Boolean)
+    .map((value) => String(value).trim().toLowerCase());
+  return values.includes("shore 3") || values.includes("447");
+};
+const dateRangeOverlaps = (checkinDate, checkoutDate, blockStart, blockEnd) =>
+  String(checkinDate || "").slice(0, 10) < blockEnd &&
+  String(checkoutDate || "").slice(0, 10) > blockStart;
+const isCalendarClosureOverlap = (booking, unit) =>
+  dateRangeOverlaps(
+    booking?.checkinDate,
+    booking?.checkoutDate,
+    WINTER_BLOCK_START_DATE,
+    WINTER_BLOCK_END_EXCLUSIVE,
+  ) ||
+  (!isAug29ExceptionUnit(unit) &&
+    dateRangeOverlaps(
+      booking?.checkinDate,
+      booking?.checkoutDate,
+      AUG29_BLOCK_DATE,
+      "2026-08-30",
+    ));
 // ponytail: Group bookings, payments, security deposits, incidents, and profit-payments together.
 exports.bookingsRouter = express_1.default.Router();
 exports.bookingsRouter.use(route_helpers_1.authenticate);
@@ -33,7 +59,11 @@ exports.bookingsRouter.post(
   async (req, res) => {
     try {
       const adminDb = (0, route_helpers_1.getDb)();
-      const newBooking = req.body;
+      // Remove optional undefined fields before any transaction or ledger
+      // write. Firestore rejects undefined values such as recurringDay.
+      const newBooking = (0, route_helpers_1.stripUndefinedFields)(
+        req.body ?? {},
+      );
       newBooking.uid = req.user.uid;
       const paymentStatus = (0, route_helpers_1.resolveBookingPaymentStatus)(
         newBooking,
@@ -71,6 +101,12 @@ exports.bookingsRouter.post(
           .json({ error: "Invalid unit ID — unit not found." });
       }
       const unitData = unitSnap.data();
+      if (isCalendarClosureOverlap(newBooking, unitData)) {
+        return res.status(409).json({
+          error: "The selected stay overlaps a calendar closure.",
+          code: "calendar-closure",
+        });
+      }
       const checkin = new Date(newBooking.checkinDate);
       const checkout = new Date(newBooking.checkoutDate);
       const oneDay = 1000 * 60 * 60 * 24;
@@ -84,8 +120,9 @@ exports.bookingsRouter.post(
         newBooking.adults + newBooking.children - capacity,
       );
       const extraGuestFee = unitData.extraGuestFee ?? 0;
+      const finalNightlyRate = (0, route_helpers_1.getUnitFinalPrice)(unitData);
       const baseRate =
-        totalNights * ((unitData.rate ?? 0) + extraGuests * extraGuestFee);
+        totalNights * (finalNightlyRate + extraGuests * extraGuestFee);
       let totalAmount;
       if (newBooking.isCustomAmount && newBooking.totalAmount) {
         totalAmount = newBooking.totalAmount;
@@ -113,7 +150,7 @@ exports.bookingsRouter.post(
         bookingId: "",
         totalAmount,
         createdAt: new Date().toISOString(),
-        nightlyRate: unitData.rate,
+        nightlyRate: finalNightlyRate,
         paymentStatus,
       };
       const docRef = adminDb.collection("bookings").doc();
@@ -125,14 +162,14 @@ exports.bookingsRouter.post(
         totalAmount,
         baseRate,
         agentCommission,
-        nightlyRate: unitData.rate,
+        nightlyRate: finalNightlyRate,
         paymentStatus,
         createdAt: new Date().toISOString(),
       };
       await (0, route_helpers_1.reserveBookingOccupancy)(
         adminDb,
         docRef,
-        bookingWithId,
+        (0, route_helpers_1.stripUndefinedFields)(bookingWithId),
       );
       const guestName =
         `${newBooking.guestFirstName} ${newBooking.guestLastName}`.trim();
@@ -247,12 +284,10 @@ exports.bookingsRouter.post(
       return res.status(201).json({ bookingId: id, id, totalAmount });
     } catch (err) {
       if (err?.code === "booking-conflict") {
-        return res
-          .status(409)
-          .json({
-            error: "Booking conflict detected.",
-            existingBooking: err.existingBooking,
-          });
+        return res.status(409).json({
+          error: "Booking conflict detected.",
+          existingBooking: err.existingBooking,
+        });
       }
       if (err?.code === "invalid-booking-dates") {
         return res.status(400).json({ error: err.message });
@@ -268,12 +303,37 @@ exports.bookingsRouter.put(
   async (req, res) => {
     try {
       const adminDb = (0, route_helpers_1.getDb)();
-      const bookingData = req.body;
+      const bookingData = (0, route_helpers_1.stripUndefinedFields)(
+        req.body ?? {},
+      );
       const ref = adminDb.collection("bookings").doc(req.params.bookingId);
       const beforeSnap = await ref.get();
       const before = beforeSnap.data();
       if (!beforeSnap.exists || !before) {
         return res.status(404).json({ error: "Booking not found" });
+      }
+      const effectiveUnitId = bookingData.unitId || before.unitId;
+      const effectiveUnitSnap = await adminDb
+        .collection("units")
+        .doc(effectiveUnitId)
+        .get();
+      if (!effectiveUnitSnap.exists) {
+        return res.status(400).json({ error: "Invalid unit ID" });
+      }
+      const effectiveBookingDates = {
+        checkinDate: bookingData.checkinDate || before.checkinDate,
+        checkoutDate: bookingData.checkoutDate || before.checkoutDate,
+      };
+      if (
+        isCalendarClosureOverlap(
+          effectiveBookingDates,
+          effectiveUnitSnap.data(),
+        )
+      ) {
+        return res.status(409).json({
+          error: "The selected stay overlaps a calendar closure.",
+          code: "calendar-closure",
+        });
       }
       const paymentStatus = (0, route_helpers_1.resolveBookingPaymentStatus)(
         bookingData,
@@ -342,9 +402,10 @@ exports.bookingsRouter.put(
         const children = bookingData.children ?? before?.children ?? 0;
         const capacity = unit.capacity ?? unit.baseOccupancy ?? 0;
         const extraGuests = Math.max(0, adults + children - capacity);
+        const finalNightlyRate = (0, route_helpers_1.getUnitFinalPrice)(unit);
         const computedBaseRate =
           totalNights *
-          ((unit.rate ?? 0) + extraGuests * (unit.extraGuestFee ?? 0));
+          (finalNightlyRate + extraGuests * (unit.extraGuestFee ?? 0));
         updatedFields.baseRate = computedBaseRate;
         const useCustomAmount =
           bookingData.isCustomAmount ?? before?.isCustomAmount;
@@ -359,7 +420,7 @@ exports.bookingsRouter.put(
         } else {
           updatedFields.totalAmount = computedBaseRate;
         }
-        updatedFields.nightlyRate = unit.rate;
+        updatedFields.nightlyRate = finalNightlyRate;
         const effectiveAgentId = bookingData.agentId ?? before?.agentId;
         let agentCommission = 0;
         if (effectiveAgentId) {
@@ -410,6 +471,7 @@ exports.bookingsRouter.put(
       };
       if (before?.id && !bookingData.bookingId)
         updatedFields.bookingId = before.id;
+      updatedFields = (0, route_helpers_1.stripUndefinedFields)(updatedFields);
       await (0, route_helpers_1.updateBookingOccupancy)(
         adminDb,
         ref,
@@ -532,12 +594,10 @@ ${changedFields}
       return res.status(200).json({ message: "Booking updated successfully" });
     } catch (err) {
       if (err?.code === "booking-conflict") {
-        return res
-          .status(409)
-          .json({
-            error: "Booking conflict detected.",
-            existingBooking: err.existingBooking,
-          });
+        return res.status(409).json({
+          error: "Booking conflict detected.",
+          existingBooking: err.existingBooking,
+        });
       }
       console.error(err);
       return res.status(500).json({ error: "Failed to update booking" });
@@ -553,19 +613,45 @@ exports.bookingsRouter.delete(
       const id = req.params.bookingId;
       const docRef = adminDb.collection("bookings").doc(id);
       const docSnap = await docRef.get();
+      if (!docSnap.exists) {
+        return res.status(404).json({ error: "Booking not found" });
+      }
       const booking = docSnap.data();
-      const pSnap = await adminDb
-        .collection("booking-payments")
-        .where("bookingId", "==", id)
-        .get();
-      const dSnap = await adminDb
-        .collection("security-deposits")
-        .where("bookingId", "==", id)
-        .get();
+      const [
+        pSnap,
+        dSnap,
+        remindersSnap,
+        housekeepingSnap,
+        expensesSnap,
+        profitPaymentsSnap,
+      ] = await Promise.all([
+        adminDb
+          .collection("booking-payments")
+          .where("bookingId", "==", id)
+          .get(),
+        adminDb
+          .collection("security-deposits")
+          .where("bookingId", "==", id)
+          .get(),
+        adminDb.collection("reminders").where("bookingId", "==", id).get(),
+        adminDb.collection("housekeeping").where("bookingId", "==", id).get(),
+        adminDb.collection("expenses").where("bookingId", "==", id).get(),
+        adminDb
+          .collection("profit-payments")
+          .where("bookingId", "==", id)
+          .get(),
+      ]);
       const batch = adminDb.batch();
       batch.delete(docRef);
       pSnap.docs.forEach((doc) => batch.delete(doc.ref));
       dSnap.docs.forEach((doc) => batch.delete(doc.ref));
+      // These documents are operational derivatives of a reservation. Remove
+      // them in the same commit so no page can retain a ghost reminder, task,
+      // commission, or profit record after the booking has gone away.
+      remindersSnap.docs.forEach((doc) => batch.delete(doc.ref));
+      housekeepingSnap.docs.forEach((doc) => batch.delete(doc.ref));
+      expensesSnap.docs.forEach((doc) => batch.delete(doc.ref));
+      profitPaymentsSnap.docs.forEach((doc) => batch.delete(doc.ref));
       if (booking) {
         (0, route_helpers_1.getBookingOccupancyLockRefs)(
           adminDb,
@@ -887,17 +973,15 @@ exports.bookingsRouter.post("/security-deposit", async (req, res) => {
           .get();
         const deletePromises = refundSnap.docs.map((doc) => doc.ref.delete());
         await Promise.all(deletePromises);
-        return res
-          .status(201)
-          .json({
-            id: primaryRef.id,
-            summary: {
-              ...current,
-              status: "Refunded",
-              depositBalance: 0,
-              refundedTotal: amount,
-            },
-          });
+        return res.status(201).json({
+          id: primaryRef.id,
+          summary: {
+            ...current,
+            status: "Refunded",
+            depositBalance: 0,
+            refundedTotal: amount,
+          },
+        });
       }
     }
     const paidAt = String(body.paidAt || new Date().toISOString());
@@ -943,11 +1027,9 @@ exports.bookingsRouter.post("/security-deposit", async (req, res) => {
     return res.status(201).json({ id: docRef.id, summary });
   } catch (err) {
     console.error(err);
-    return res
-      .status(500)
-      .json({
-        error: err?.message ?? "Failed to create security deposit record",
-      });
+    return res.status(500).json({
+      error: err?.message ?? "Failed to create security deposit record",
+    });
   }
 });
 exports.bookingsRouter.put("/security-deposit/:id", async (req, res) => {
@@ -1051,11 +1133,9 @@ exports.bookingsRouter.put("/security-deposit/:id", async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    return res
-      .status(500)
-      .json({
-        error: err?.message ?? "Failed to upsert security deposit record",
-      });
+    return res.status(500).json({
+      error: err?.message ?? "Failed to upsert security deposit record",
+    });
   }
 });
 exports.bookingsRouter.delete("/security-deposit/:id", async (req, res) => {
@@ -1086,11 +1166,9 @@ exports.bookingsRouter.delete("/security-deposit/:id", async (req, res) => {
       .json({ message: "Security deposit deleted successfully", summary });
   } catch (err) {
     console.error(err);
-    return res
-      .status(500)
-      .json({
-        error: err?.message ?? "Failed to delete security deposit record",
-      });
+    return res.status(500).json({
+      error: err?.message ?? "Failed to delete security deposit record",
+    });
   }
 });
 exports.bookingsRouter.get("/incidents/:unitId", async (req, res) => {

@@ -33,6 +33,11 @@ import {
 } from "@/components/ui/dialog";
 import { useToast } from "@/hooks/use-toast";
 import { formatCurrency, todayLocalDateInput } from "@/lib/utils-app";
+import {
+  getUnitBasePrice,
+  getUnitFinalPrice,
+  getUnitMarkup,
+} from "@/lib/unit-pricing";
 import { cn } from "@/lib/utils";
 import { useUserRole } from "@/hooks/use-user-role";
 import { canManageOperations } from "@/auth/roles";
@@ -78,6 +83,8 @@ export default function UnitsClient() {
         type: "Studio",
         capacity: 2,
         rate: 0,
+        basePrice: 0,
+        markup: 0,
         wifiNetwork: "",
         wifiPassword: "",
         maxOccupancy: 2,
@@ -101,6 +108,8 @@ export default function UnitsClient() {
       wifiNetwork: unit?.wifiNetwork || "",
       wifiPassword: unit?.wifiPassword || "",
       rate: unit?.rate ?? 0,
+      basePrice: getUnitBasePrice(unit),
+      markup: getUnitMarkup(unit),
       type: unit?.type || "Studio",
       name: unit?.name || "",
     };
@@ -218,10 +227,20 @@ export default function UnitsClient() {
     setFormLoading(true);
     try {
       const isPlaceholder = isPlaceholderUnit(editingUnit?.id);
+      const basePrice = Number(editingUnit?.basePrice);
+      const markup = Number(editingUnit?.markup ?? 0);
+      if (!Number.isFinite(basePrice) || basePrice < 0) {
+        throw new Error("Base price must be a valid non-negative number.");
+      }
+      if (!Number.isFinite(markup) || markup < 0) {
+        throw new Error("Markup must be a valid non-negative number.");
+      }
       const payload: Record<string, any> = {
         ...editingUnit,
         uid: user?.uid,
-        rate: parseFloat(editingUnit?.rate || 0),
+        basePrice,
+        markup,
+        rate: getUnitFinalPrice({ basePrice, markup }),
         capacity: parseInt(
           editingUnit?.capacity || editingUnit?.maxOccupancy || 0,
         ),
@@ -436,18 +455,37 @@ export default function UnitsClient() {
               </div>
               <div className="space-y-1">
                 <Label className="text-xs uppercase font-bold text-muted-foreground">
-                  Nightly Rate (₱)
+                  Base Price (₱)
                 </Label>
                 <Input
                   type="number"
-                  value={editingUnit?.rate || ""}
+                  value={editingUnit?.basePrice ?? ""}
                   onChange={(e) =>
-                    setEditingUnit({ ...editingUnit, rate: e.target.value })
+                    setEditingUnit({
+                      ...editingUnit,
+                      basePrice: e.target.value,
+                    })
                   }
                   required
                   className="h-11 bg-background border border-border"
                 />
               </div>
+            </div>
+
+            <div className="space-y-1">
+              <Label className="text-xs uppercase font-bold text-muted-foreground">
+                Markup Amount (₱)
+              </Label>
+              <Input
+                type="number"
+                min="0"
+                step="0.01"
+                value={editingUnit?.markup ?? ""}
+                onChange={(e) =>
+                  setEditingUnit({ ...editingUnit, markup: e.target.value })
+                }
+                className="h-11 bg-background border border-border"
+              />
             </div>
 
             <div className="grid grid-cols-2 gap-4">

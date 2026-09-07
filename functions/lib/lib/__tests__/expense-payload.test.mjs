@@ -175,6 +175,20 @@ describe("expense Firestore payload", () => {
     expect(cleaned.distributionValues).toEqual({ a: 1 });
   });
 
+  it("removes optional recurringDay before a booking-style Firestore write", () => {
+    const cleaned = stripUndefinedFields({
+      paymentStatus: "Unpaid",
+      bookingPayment: { status: "Unpaid", paymentStatus: "Unpaid" },
+      recurringDay: undefined,
+    });
+
+    expect(cleaned).toEqual({
+      paymentStatus: "Unpaid",
+      bookingPayment: { status: "Unpaid", paymentStatus: "Unpaid" },
+    });
+    expect("recurringDay" in cleaned).toBe(false);
+  });
+
   it("K: normalizeRoleName accepts only admin/staff/viewer and trims case", () => {
     expect(normalizeRoleName("  ADMIN  ")).toBe("admin");
     expect(normalizeRoleName(" Staff ")).toBe("staff");

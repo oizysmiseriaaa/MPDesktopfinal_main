@@ -66,6 +66,7 @@ import {
 import { BookingDetailsDialog } from "./booking-details-dialog";
 import { useUserRole } from "@/hooks/use-user-role";
 import { canManageOperations } from "@/auth/roles";
+import { getUnitBasePrice } from "@/lib/unit-pricing";
 
 function canvasToPngBytes(canvas: HTMLCanvasElement): Promise<Uint8Array> {
   return new Promise((resolve, reject) => {
@@ -437,7 +438,7 @@ export default function BookingsClient() {
       const relativePath = buildBookingImageRelativePath(editingBooking);
       const { mkdir, writeFile, BaseDirectory } =
         await import("@tauri-apps/plugin-fs");
-      await mkdir("Bookings", {
+      await mkdir("ManilaPrime/Bookings", {
         baseDir: BaseDirectory.Desktop,
         recursive: true,
       });
@@ -702,7 +703,7 @@ export default function BookingsClient() {
             (checkout.getTime() - checkin.getTime()) / (1000 * 60 * 60 * 24),
           ),
         );
-        const baseRate = toNumber(selectedUnit?.rate, 0);
+        const baseRate = getUnitBasePrice(selectedUnit);
 
         const commissionAmount = Math.max(
           0,

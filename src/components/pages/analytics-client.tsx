@@ -55,6 +55,7 @@ import {
 } from "@/lib/utils-app";
 import { useDateStore } from "@/lib/date-store";
 import { getHistoricalSummaryForMonth } from "@/lib/historical-expense-summaries";
+import { getUnitBasePrice } from "@/lib/unit-pricing";
 import { Badge } from "@/components/ui/badge";
 import Link from "next/link";
 import {
@@ -554,7 +555,7 @@ export default function AnalyticsClient() {
                     (1000 * 60 * 60 * 24),
                 ),
               );
-              const baseCost = nights * Number(unit.rate || 0);
+              const baseCost = nights * getUnitBasePrice(unit);
               const surplus = Math.max(
                 0,
                 Number(b.totalAmount || 0) - baseCost,
