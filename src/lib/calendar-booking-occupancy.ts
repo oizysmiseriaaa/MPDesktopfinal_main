@@ -1,7 +1,22 @@
-export const normalizeCalendarDate = (value: unknown) => {
+export const normalizeCalendarDate = (value: unknown): string => {
+  if (value && typeof value === "object") {
+    const timestamp = value as { toDate?: () => Date; seconds?: number };
+    if (typeof timestamp.toDate === "function") {
+      return normalizeCalendarDate(timestamp.toDate());
+    }
+    if (typeof timestamp.seconds === "number") {
+      return normalizeCalendarDate(new Date(timestamp.seconds * 1000));
+    }
+  }
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
+  }
   const text = String(value || "").trim();
   const match = text.match(/^(\d{4}-\d{2}-\d{2})/);
-  return match?.[1] || "";
+  if (match?.[1]) return match[1];
+  const slashMatch = text.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})/);
+  if (!slashMatch) return "";
+  return `${slashMatch[3]}-${slashMatch[1].padStart(2, "0")}-${slashMatch[2].padStart(2, "0")}`;
 };
 
 export const getBookingUnitReference = (booking: any) =>

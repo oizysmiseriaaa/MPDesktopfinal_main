@@ -252,8 +252,8 @@ export const OFFICIAL_UNITS: OfficialUnitSeed[] = [
     source: "official",
   },
   {
-    name: "Parking 768",
-    unitNumber: "Parking 768",
+    name: "Parking 762",
+    unitNumber: "Parking 762",
     type: "Parking",
     capacity: 1,
     maxOccupancy: 1,

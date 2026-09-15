@@ -58,4 +58,12 @@ describe("calendar booking occupancy", () => {
       ),
     ).toEqual(["2026-08-20", "2026-08-21"]);
   });
+
+  it("normalizes slash dates and supports multi-month ranges", () => {
+    expect(
+      getOccupiedCalendarDates(
+        booking("b-1", "u1", "10/30/2026", "12/02/2026"),
+      ),
+    ).toHaveLength(33);
+  });
 });

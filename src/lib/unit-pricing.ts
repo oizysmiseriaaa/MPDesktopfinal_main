@@ -9,7 +9,7 @@ export function getUnitBasePrice(unit: any) {
 }
 
 export function getUnitMarkup(unit: any) {
-  return toSafeUnitNumber(unit?.markup, 0);
+  return Math.max(0, toSafeUnitNumber(unit?.markup, 0));
 }
 
 export function getUnitFinalPrice(unit: any) {

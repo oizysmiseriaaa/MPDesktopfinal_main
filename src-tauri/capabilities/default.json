@@ -16,6 +16,8 @@
         { "path": "$DESKTOP/ManilaPrime/*" },
         { "path": "$DESKTOP/ManilaPrime/Bookings" },
         { "path": "$DESKTOP/ManilaPrime/Bookings/*" },
+        { "path": "$DESKTOP/ManilaPrime/GuestAuthorization" },
+        { "path": "$DESKTOP/ManilaPrime/GuestAuthorization/*" },
         { "path": "$DESKTOP/ManilaPrime/Quotations" },
         { "path": "$DESKTOP/ManilaPrime/Quotations/*" },
         { "path": "$DESKTOP/ManilaPrime/SOA" },

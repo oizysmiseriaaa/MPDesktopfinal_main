@@ -22,6 +22,8 @@ import {
 // Keep the booking form separate from the calendar orchestration component.
 
 export type BookingDraft = {
+  checkinDate?: string;
+  checkoutDate?: string;
   guestFirstName: string;
   guestLastName: string;
   guestPhone: string;
@@ -127,15 +129,19 @@ export function AddBookingDialog({
 }: AddBookingDialogProps) {
   // Keep typing state inside the dialog. Updating a name or a note should not
   // rerender the hundreds of calendar cells behind the modal.
-  const [bookingDraft, setLocalBookingDraft] = React.useState(initialBookingDraft);
+  const [bookingDraft, setLocalBookingDraft] =
+    React.useState(initialBookingDraft);
 
   React.useEffect(() => {
     if (open) setLocalBookingDraft(initialBookingDraft);
   }, [initialBookingDraft, open]);
 
-  const updateDraft = React.useCallback((field: keyof BookingDraft, value: any) => {
-    setLocalBookingDraft((draft) => ({ ...draft, [field]: value }));
-  }, []);
+  const updateDraft = React.useCallback(
+    (field: keyof BookingDraft, value: any) => {
+      setLocalBookingDraft((draft) => ({ ...draft, [field]: value }));
+    },
+    [],
+  );
   const setBookingDraft: React.Dispatch<React.SetStateAction<BookingDraft>> =
     React.useCallback((next) => {
       setLocalBookingDraft((draft) =>
@@ -145,14 +151,18 @@ export function AddBookingDialog({
   const setDraftNested = React.useCallback((path: string, value: any) => {
     setLocalBookingDraft((draft: any) => {
       const [parent, child] = path.split(".");
-      return { ...draft, [parent]: { ...(draft[parent] || {}), [child]: value } };
+      return {
+        ...draft,
+        [parent]: { ...(draft[parent] || {}), [child]: value },
+      };
     });
   }, []);
   const getAgentLabel = (agent: any) =>
     agent?.name || agent?.fullName || agent?.agentName || "Unnamed Agent";
   const selectedSource = bookingSourceOptions.some(
     (source) =>
-      source.value.toLowerCase() === String(bookingDraft.bookingSource || "").toLowerCase(),
+      source.value.toLowerCase() ===
+      String(bookingDraft.bookingSource || "").toLowerCase(),
   )
     ? bookingDraft.bookingSource
     : "N/A";
@@ -173,7 +183,10 @@ export function AddBookingDialog({
           <DialogTitle>New Booking from Calendar</DialogTitle>
           <DialogDescription>Selected Calendar Dates</DialogDescription>
         </DialogHeader>
-        <form onSubmit={(event) => onSave(event, bookingDraft)} className="space-y-4 pt-4">
+        <form
+          onSubmit={(event) => onSave(event, bookingDraft)}
+          className="space-y-4 pt-4"
+        >
           <div className="rounded-xl border bg-amber-50/60 p-4">
             <div className="mb-3 flex items-center justify-between gap-3">
               <p className="text-xs font-black uppercase tracking-[0.16em] text-amber-700">
@@ -208,6 +221,37 @@ export function AddBookingDialog({
               </div>
             ))}
           </div>
+
+          {selectedRanges.length === 1 && (
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-1">
+                <Label>Check-in</Label>
+                <Input
+                  type="date"
+                  value={
+                    bookingDraft.checkinDate || selectedRanges[0].checkinDate
+                  }
+                  onChange={(event) =>
+                    updateDraft("checkinDate", event.target.value)
+                  }
+                  required
+                />
+              </div>
+              <div className="space-y-1">
+                <Label>Check-out</Label>
+                <Input
+                  type="date"
+                  value={
+                    bookingDraft.checkoutDate || selectedRanges[0].checkoutDate
+                  }
+                  onChange={(event) =>
+                    updateDraft("checkoutDate", event.target.value)
+                  }
+                  required
+                />
+              </div>
+            </div>
+          )}
 
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-1">

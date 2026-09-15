@@ -58,6 +58,8 @@ import { cn } from "@/lib/utils";
 import { useDialogCleanup } from "@/hooks/use-dialog-cleanup";
 import html2canvas from "html2canvas";
 import { createBookingPdf, type BookingDocumentType } from "@/lib/booking-pdf";
+import { createGuestAuthorizationPdf } from "@/lib/guest-authorization-pdf";
+import { loadTauriFs } from "@/lib/tauri-runtime";
 import {
   getBookingSourceColor,
   getBookingSourceDisplayName,
@@ -66,7 +68,6 @@ import {
 import { BookingDetailsDialog } from "./booking-details-dialog";
 import { useUserRole } from "@/hooks/use-user-role";
 import { canManageOperations } from "@/auth/roles";
-import { getUnitBasePrice } from "@/lib/unit-pricing";
 
 function canvasToPngBytes(canvas: HTMLCanvasElement): Promise<Uint8Array> {
   return new Promise((resolve, reject) => {
@@ -410,15 +411,43 @@ export default function BookingsClient() {
 
   const handleCopyAuthorizationLetter = async () => {
     if (!editingBooking) return;
-    const text = `Dear Admin,\n\nI'm Rey Arjay Rojo Patiag, SPA of the said unit, please allow my GUEST\nto enter and stay in the said unit from ${toDateInput(editingBooking?.checkinDate)} to ${toDateInput(editingBooking?.checkoutDate)}\n\nUNIT: ${getBookingUnitName(editingBooking)}\n\nGUEST:\n${getBookingGuestName(editingBooking)}\n\nThank you very much!`;
+
     try {
-      await navigator.clipboard.writeText(text);
-      toast({ title: "Letter copied", description: "Ready to paste." });
-    } catch (e: any) {
+      const document = await createGuestAuthorizationPdf({
+        booking: editingBooking,
+        unit: findUnitForBooking(editingBooking.unitId),
+      });
+
+      const { mkdir, writeFile, BaseDirectory } = await loadTauriFs();
+      const folder = "ManilaPrime/GuestAuthorization";
+      const filePath = `${folder}/${document.fileName}`;
+
+      await mkdir(folder, {
+        baseDir: BaseDirectory.Desktop,
+        recursive: true,
+      });
+
+      await writeFile(filePath, document.bytes, {
+        baseDir: BaseDirectory.Desktop,
+        create: true,
+      });
+
+      toast({
+        title: "Guest authorization form generated",
+        description: `Saved to Desktop/${filePath}`,
+      });
+    } catch (error: any) {
+      console.error("Guest authorization PDF generation failed", error);
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Unable to generate the guest authorization form.";
       toast({
         variant: "destructive",
-        title: "Copy failed",
-        description: e.message,
+        title: "Document generation failed",
+        description: message.includes("desktop app")
+          ? "This export is only available in the desktop app."
+          : message,
       });
     }
   };
@@ -436,8 +465,7 @@ export default function BookingsClient() {
         logging: false,
       });
       const relativePath = buildBookingImageRelativePath(editingBooking);
-      const { mkdir, writeFile, BaseDirectory } =
-        await import("@tauri-apps/plugin-fs");
+      const { mkdir, writeFile, BaseDirectory } = await loadTauriFs();
       await mkdir("ManilaPrime/Bookings", {
         baseDir: BaseDirectory.Desktop,
         recursive: true,
@@ -475,8 +503,7 @@ export default function BookingsClient() {
       });
       if (!document.bytes?.length) throw new Error("Generated PDF is empty.");
 
-      const { mkdir, writeFile, BaseDirectory } =
-        await import("@tauri-apps/plugin-fs");
+      const { mkdir, writeFile, BaseDirectory } = await loadTauriFs();
       const folder =
         type === "quotation" ? "ManilaPrime/Quotations" : "ManilaPrime/SOA";
       const path = `${folder}/${document.fileName}`;
@@ -691,61 +718,6 @@ export default function BookingsClient() {
         }
 
         toast({ title: "Success", description: "New booking created." });
-      }
-
-      // Auto-create agent commission expense
-      if (editingBooking?.agentId && selectedAgent) {
-        const checkin = new Date(editingBooking.checkinDate);
-        const checkout = new Date(editingBooking.checkoutDate);
-        const nights = Math.max(
-          1,
-          Math.round(
-            (checkout.getTime() - checkin.getTime()) / (1000 * 60 * 60 * 24),
-          ),
-        );
-        const baseRate = getUnitBasePrice(selectedUnit);
-
-        const commissionAmount = Math.max(
-          0,
-          finalTotalAmount - baseRate * nights,
-        );
-
-        if (commissionAmount > 0) {
-          const guestName =
-            `${editingBooking.guestFirstName || ""} ${editingBooking.guestLastName || ""}`.trim();
-          try {
-            // Deterministic ID to prevent duplicates on retry/resubmit
-            const commissionId = `agent-commission-${savedBookingId}-${editingBooking.agentId}`;
-            await apiClient.post(
-              "/expense",
-              {
-                id: commissionId,
-                uid: user?.uid,
-                title: `Commission - ${selectedAgent.name} - ${guestName}`,
-                category: "Agent Commission",
-                agentId: editingBooking.agentId,
-                agentName: selectedAgent.name || "",
-                bookingId: savedBookingId,
-                amount: Math.round(commissionAmount * 100) / 100,
-                date: editingBooking.checkinDate,
-                commissionStatus: "on hold",
-                unitId: editingBooking.unitId || "",
-                unitName: selectedUnit?.name || "",
-                paymentMethod: "CASH",
-                notes: `Auto-generated commission for ${guestName} (${nights} nights)`,
-                createdAt: new Date().toISOString(),
-              },
-              auth,
-            );
-          } catch (err) {
-            console.error("Failed to create agent commission:", err);
-            toast({
-              variant: "destructive",
-              title: "Warning",
-              description: `Booking saved but agent commission creation failed. Please create the commission manually.`,
-            });
-          }
-        }
       }
 
       setIsDialogOpen(false);

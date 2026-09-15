@@ -40,7 +40,11 @@ import {
 import { useDateStore } from "@/lib/date-store";
 import { useDialogCleanup } from "@/hooks/use-dialog-cleanup";
 import { cn } from "@/lib/utils";
-import { todayLocalDateInput, parseLocalDateInput } from "@/lib/utils-app";
+import {
+  todayLocalDateInput,
+  parseLocalDateInput,
+  normalizeBookingPaymentState,
+} from "@/lib/utils-app";
 import { ScrollArea, ScrollBar } from "@/components/ui/scroll-area";
 import { Card } from "@/components/ui/card";
 import { Switch } from "@/components/ui/switch";
@@ -69,6 +73,8 @@ import {
 } from "@/lib/calendar-operations";
 import { getHousekeepingTaskId } from "@/lib/housekeeping";
 import { createBookingPdf, type BookingDocumentType } from "@/lib/booking-pdf";
+import { createGuestAuthorizationPdf } from "@/lib/guest-authorization-pdf";
+import { loadTauriFs } from "@/lib/tauri-runtime";
 import { useUserRole } from "@/hooks/use-user-role";
 import { canManageOperations } from "@/auth/roles";
 import {
@@ -80,10 +86,11 @@ import {
 import { summarizeBookingBatchResults } from "@/lib/booking-batch";
 import {
   BOOKING_SOURCE_LEGEND,
+  getBookingStatusLabel,
   getBookingSourceLabel,
   type BookingSourceLabel,
 } from "@/lib/booking-source";
-import { getUnitBasePrice } from "@/lib/unit-pricing";
+import { getBookingNights } from "@/lib/agent-commission";
 
 const unitColors = [
   "#2563EB",
@@ -108,7 +115,7 @@ const unitColors = [
 
 const bookingLabelStyles = BOOKING_SOURCE_LEGEND;
 type BookingLabel = BookingSourceLabel;
-const getBookingLabel = getBookingSourceLabel;
+const getBookingLabel = getBookingStatusLabel;
 
 // Darken a hex color so unit-colored bars stay prominent with white text
 // while keeping the unit's identity color.
@@ -155,6 +162,8 @@ type UnitDateRange = {
 };
 
 type BookingDraft = {
+  checkinDate?: string;
+  checkoutDate?: string;
   guestFirstName: string;
   guestLastName: string;
   guestPhone: string;
@@ -163,6 +172,7 @@ type BookingDraft = {
   agentName: string;
   bookingSource: string;
   bookingLabel: string;
+  bookingStatus?: string;
   bookingDate: string;
   adults: number;
   children: number;
@@ -367,6 +377,8 @@ const toComparableUnitValues = (unit: any) =>
 const makeDefaultBookingDraft = (): BookingDraft => {
   const today = todayDateInput();
   return {
+    checkinDate: "",
+    checkoutDate: "",
     guestFirstName: "",
     guestLastName: "",
     guestPhone: "",
@@ -375,6 +387,7 @@ const makeDefaultBookingDraft = (): BookingDraft => {
     agentName: "",
     bookingSource: "N/A",
     bookingLabel: "N/A",
+    bookingStatus: "Reserved",
     bookingDate: today,
     adults: 2,
     children: 0,
@@ -680,13 +693,6 @@ export default function CalendarClient() {
     compactBase,
     Math.round(compactBase * zoomScale),
   );
-  const computedUnitRowHeight = Math.max(
-    compactBase,
-    Math.round(compactBase * zoomScale),
-  );
-  const fullScreenCardPadding = zoomScale < 0.85 ? 8 : 10;
-  const fullScreenFontSize = zoomScale < 0.85 ? 10 : 11;
-  const fullScreenCompactTextSize = zoomScale < 0.85 ? 8 : 9;
   const dayStyle = {
     width: `${computedDayWidth}px`,
     minWidth: `${computedDayWidth}px`,
@@ -895,12 +901,9 @@ export default function CalendarClient() {
   };
 
   const getBookingUnit = (booking: any) =>
-    findUnitForBooking(
-      booking?.unitId ||
-        booking?.unit_id ||
-        booking?.unitName ||
-        booking?.unitname,
-    );
+    [booking?.unitId, booking?.unit_id, booking?.unitName, booking?.unitname]
+      .map((value) => findUnitForBooking(value))
+      .find(Boolean) || null;
 
   const calendarBookingByCell = useMemo(
     () =>
@@ -909,6 +912,18 @@ export default function CalendarClient() {
       ),
     [calendarBookings, units],
   );
+
+  const calendarBookingsByUnit = useMemo(() => {
+    const byUnit = new Map<string, any[]>();
+    for (const booking of calendarBookings as any[]) {
+      const unitId = String(getBookingUnit(booking)?.id || "");
+      if (!unitId) continue;
+      const bookingsForUnit = byUnit.get(unitId) || [];
+      bookingsForUnit.push(booking);
+      byUnit.set(unitId, bookingsForUnit);
+    }
+    return byUnit;
+  }, [calendarBookings, units]);
 
   // Inquiry mode: reuse existing availability/occupancy logic to summarize which
   // units are available vs occupied for the selected date range. No bookings are
@@ -1058,22 +1073,22 @@ export default function CalendarClient() {
     getOperationsStatus(booking, systemNow);
 
   const getPaymentStatus = (booking: any) => {
-    const status = String(
+    const rawStatus = String(
       booking?.paymentStatus ||
         booking?.bookingPaymentStatus ||
         booking?.bookingPayment?.status ||
         "Unpaid",
-    )
-      .trim()
-      .toLowerCase();
+    );
+    const status = rawStatus.trim().toLowerCase();
+    const normalizedStatus = normalizeBookingPaymentState(rawStatus);
 
-    if (status === "paid" || status.includes("paid")) {
+    if (normalizedStatus === "Paid") {
       return { label: "Paid", color: "#16a34a", key: "paid" as const };
     }
-    if (status.includes("partial")) {
+    if (normalizedStatus === "Partial") {
       return { label: "Partial", color: "#3b82f6", key: "partial" as const };
     }
-    if (status.includes("refund") || status.includes("refunded")) {
+    if (normalizedStatus === "Refunded") {
       return { label: "Refunded", color: "#111827", key: "refunded" as const };
     }
     if (status.includes("received") || status.includes("deposit")) {
@@ -1256,7 +1271,7 @@ export default function CalendarClient() {
       const monthStart = startOfMonth(viewDate);
       const monthEnd = endOfMonth(viewDate);
 
-      for (const booking of calendarBookings as any[]) {
+      for (const booking of calendarBookingsByUnit.get(unitId) || []) {
         const ownedDates = getOccupiedCalendarDates(booking).filter(
           (date) => calendarBookingByCell.get(`${unitId}__${date}`) === booking,
         );
@@ -1362,7 +1377,13 @@ export default function CalendarClient() {
         });
       });
     },
-    [viewDate, daysInMonth, calendarBookingByCell, calendarBookings, systemNow],
+    [
+      viewDate,
+      daysInMonth,
+      calendarBookingByCell,
+      calendarBookingsByUnit,
+      systemNow,
+    ],
   );
 
   const bookingBarsByUnit = useMemo(() => {
@@ -1423,8 +1444,7 @@ export default function CalendarClient() {
       });
       const pngBytes = await canvasToPngBytes(canvas);
 
-      const { exists, mkdir, writeFile, BaseDirectory } =
-        await import("@tauri-apps/plugin-fs");
+      const { exists, mkdir, writeFile, BaseDirectory } = await loadTauriFs();
 
       const guestName =
         [
@@ -1480,8 +1500,7 @@ export default function CalendarClient() {
         unit,
         preparedBy: user?.displayName || user?.email || null,
       });
-      const { exists, mkdir, writeFile, BaseDirectory } =
-        await import("@tauri-apps/plugin-fs");
+      const { exists, mkdir, writeFile, BaseDirectory } = await loadTauriFs();
       const folder =
         type === "quotation" ? "ManilaPrime/Quotations" : "ManilaPrime/SOA";
       const path = `${folder}/${document.fileName}`;
@@ -1796,77 +1815,6 @@ export default function CalendarClient() {
     [selection],
   );
 
-  const createAgentCommission = async (bookingData: {
-    agentId: string;
-    agentName: string;
-    totalAmount: number;
-    unitId: string;
-    unitName: string;
-    checkinDate: string;
-    checkoutDate: string;
-    guestFirstName: string;
-    guestLastName: string;
-    bookingId?: string;
-  }) => {
-    if (!bookingData.agentId) return;
-    const agent = (agents as any[]).find(
-      (a) => String(a.id) === String(bookingData.agentId),
-    );
-    if (!agent) return;
-    const checkin = new Date(bookingData.checkinDate);
-    const checkout = new Date(bookingData.checkoutDate);
-    const nights = Math.max(
-      1,
-      Math.round(
-        (checkout.getTime() - checkin.getTime()) / (1000 * 60 * 60 * 24),
-      ),
-    );
-    const unit = (units as any[]).find(
-      (u) => String(u.id) === String(bookingData.unitId),
-    );
-    const baseRate = getUnitBasePrice(unit);
-    const commissionAmount = Math.max(
-      0,
-      bookingData.totalAmount - baseRate * nights,
-    );
-    if (commissionAmount <= 0) return;
-    const guestName =
-      `${bookingData.guestFirstName} ${bookingData.guestLastName}`.trim();
-    if (!bookingData.bookingId) return;
-    const commissionId = `agent-commission-${bookingData.bookingId}-${bookingData.agentId}`;
-    const existing = (calendarResources.data["expenses"] as any[]).find(
-      (e: any) => String(e.id) === commissionId,
-    );
-    if (existing) return;
-    try {
-      const payload = removeUndefinedDeep({
-        id: commissionId,
-        uid: user?.uid,
-        title: `Commission - ${bookingData.agentName} - ${guestName}`,
-        category: "Agent Commission",
-        agentId: bookingData.agentId,
-        agentName: bookingData.agentName,
-        bookingId: bookingData.bookingId,
-        amount: Math.round(commissionAmount * 100) / 100,
-        date: bookingData.checkinDate,
-        commissionStatus: "on hold",
-        unitId: bookingData.unitId,
-        unitName: bookingData.unitName,
-        paymentMethod: "CASH",
-        notes: `Auto-generated commission for ${guestName} (${nights} nights)`,
-        createdAt: new Date().toISOString(),
-      });
-      await apiClient.post("/expense", payload, auth);
-    } catch (err) {
-      console.error("Failed to create agent commission:", err);
-      toast({
-        variant: "destructive",
-        title: "Warning",
-        description: `Booking saved but agent commission creation failed. Please create the commission manually.`,
-      });
-    }
-  };
-
   const handleSaveSelection = async (
     event: React.FormEvent,
     submittedDraft: BookingDraft = bookingDraft,
@@ -1877,9 +1825,41 @@ export default function CalendarClient() {
       toast({ variant: "destructive", title: "No available dates selected" });
       return;
     }
+    const proposedRanges = selectedRanges.map((range) => {
+      if (selectedRanges.length !== 1) return range;
+      const checkinDate = submittedDraft.checkinDate || range.checkinDate;
+      const checkoutDate = submittedDraft.checkoutDate || range.checkoutDate;
+      return {
+        ...range,
+        checkinDate,
+        checkoutDate,
+        nights: getBookingNights(checkinDate, checkoutDate),
+      };
+    });
+    if (proposedRanges.some((range) => range.nights <= 0)) {
+      toast({
+        variant: "destructive",
+        title: "Invalid booking dates",
+        description: "Check-out must be after check-in.",
+      });
+      return;
+    }
     if (
-      selection.some((cell) =>
-        calendarBookingByCell.has(`${cell.unitId}__${cell.date}`),
+      proposedRanges.some((range) =>
+        calendarBookings.some((booking) => {
+          const bookingUnit = getBookingUnit(booking);
+          if (String(bookingUnit?.id || "") !== String(range.unit.id))
+            return false;
+          const bookingStart = normalizeCalendarDate(
+            booking.checkinDate || booking.checkIn,
+          );
+          const bookingEnd = normalizeCalendarDate(
+            booking.checkoutDate || booking.checkOut,
+          );
+          return (
+            bookingStart < range.checkoutDate && bookingEnd > range.checkinDate
+          );
+        }),
       )
     ) {
       toast({
@@ -1892,24 +1872,8 @@ export default function CalendarClient() {
     }
     // Inquiry results can become stale. Recheck the exact proposed range,
     // including date-specific blocks, before any write is attempted.
-    for (const range of selectedRanges) {
-      const dates = eachDayOfInterval({
-        start: new Date(`${range.checkinDate}T00:00:00`),
-        end: addDays(new Date(`${range.checkoutDate}T00:00:00`), -1),
-      });
-      const unavailable = dates.some(
-        (day) => !isCellAvailable(range.unit, day),
-      );
-      if (unavailable) {
-        toast({
-          variant: "destructive",
-          title: "Booking conflict",
-          description:
-            "This unit is no longer available for the requested dates.",
-        });
-        setInquiryBookingRange(null);
-        return;
-      }
+    for (const range of proposedRanges) {
+      if (range.checkinDate >= range.checkoutDate) return;
     }
     const hasGuestName =
       submittedDraft.guestFirstName.trim() ||
@@ -1928,7 +1892,7 @@ export default function CalendarClient() {
         "Unpaid";
       const depositStatus = submittedDraft.securityDepositStatus || "Unpaid";
       const batchResults = await Promise.allSettled(
-        selectedRanges.map(async (range) => {
+        proposedRanges.map(async (range) => {
           const totalAmount = submittedDraft.isCustomAmount
             ? toNumber(submittedDraft.totalAmount, 0)
             : getRangeAutoAmount(range, submittedDraft);
@@ -1943,6 +1907,7 @@ export default function CalendarClient() {
             agentId: submittedDraft.agentId || "",
             agentName: submittedDraft.agentName || "",
             bookingSource: submittedDraft.bookingSource || "N/A",
+            bookingStatus: submittedDraft.bookingStatus || "Reserved",
             bookingLabel: getBookingSourceLabel(
               submittedDraft.bookingSource || "N/A",
             ),
@@ -1980,6 +1945,7 @@ export default function CalendarClient() {
             range,
             totalAmount,
             bookingId: bookingRes?.id || bookingRes?.data?.id || "",
+            commissionError: bookingRes?.commissionError || null,
           };
         }),
       );
@@ -2004,26 +1970,16 @@ export default function CalendarClient() {
         });
       }
 
-      // Commission documents are independent of booking creation, so waiting
-      // for one should not serialize every selected unit's booking request.
-      await Promise.all(
-        createdBookings.map(({ range, totalAmount, bookingId }) =>
-          submittedDraft.agentId && bookingId
-            ? createAgentCommission({
-                agentId: submittedDraft.agentId,
-                agentName: submittedDraft.agentName,
-                totalAmount: Number(totalAmount ?? 0),
-                unitId: String(range?.unit?.id ?? ""),
-                unitName: getUnitLabel(range?.unit),
-                checkinDate: range?.checkinDate || "",
-                checkoutDate: range?.checkoutDate || "",
-                guestFirstName: submittedDraft.guestFirstName.trim(),
-                guestLastName: submittedDraft.guestLastName.trim(),
-                bookingId,
-              })
-            : Promise.resolve(),
-        ),
-      );
+      const commissionWarnings = createdBookings
+        .map((booking) => booking.commissionError)
+        .filter(Boolean);
+      if (commissionWarnings.length > 0) {
+        toast({
+          variant: "destructive",
+          title: "Commission synchronization failed",
+          description: String(commissionWarnings[0]),
+        });
+      }
 
       if (failedBookings.length > 0) {
         toast({
@@ -2055,25 +2011,19 @@ export default function CalendarClient() {
     try {
       const payload = { ...detailsBooking };
       payload.bookingSource = payload.bookingSource || "N/A";
+      payload.bookingStatus = payload.bookingStatus || "Reserved";
       payload.bookingLabel = getBookingSourceLabel(payload.bookingSource);
       const sanitizedPayload = removeUndefinedDeep(payload);
-      await apiClient.put(
+      const bookingResponse = await apiClient.put<any>(
         `/booking/${detailsBooking.id}`,
         sanitizedPayload,
         auth,
       );
-      if (detailsBooking.agentId) {
-        await createAgentCommission({
-          agentId: detailsBooking.agentId,
-          agentName: detailsBooking.agentName || "",
-          totalAmount: Number(detailsBooking.totalAmount),
-          unitId: String(detailsBooking.unitId || ""),
-          unitName: detailsBooking.unitName || "",
-          checkinDate: toDateInput(detailsBooking.checkinDate) || "",
-          checkoutDate: toDateInput(detailsBooking.checkoutDate) || "",
-          guestFirstName: detailsBooking.guestFirstName || "",
-          guestLastName: detailsBooking.guestLastName || "",
-          bookingId: detailsBooking.id,
+      if (bookingResponse?.commissionError) {
+        toast({
+          variant: "destructive",
+          title: "Commission synchronization failed",
+          description: bookingResponse.commissionError,
         });
       }
       setDetailsBooking(payload);
@@ -2098,8 +2048,7 @@ export default function CalendarClient() {
         scale: 1,
         logging: false,
       });
-      const { mkdir, writeFile, BaseDirectory } =
-        await import("@tauri-apps/plugin-fs");
+      const { mkdir, writeFile, BaseDirectory } = await loadTauriFs();
       const guestName =
         [detailsBooking.guestFirstName, detailsBooking.guestLastName]
           .filter(Boolean)
@@ -2134,7 +2083,46 @@ export default function CalendarClient() {
   };
 
   const handleCopyDetailsAuthorizationLetter = async () => {
-    toast({ title: "Letter copied" });
+    if (!detailsBooking) return;
+
+    try {
+      const document = await createGuestAuthorizationPdf({
+        booking: detailsBooking,
+        unit: getBookingUnit(detailsBooking),
+      });
+
+      const { mkdir, writeFile, BaseDirectory } = await loadTauriFs();
+      const folder = "ManilaPrime/GuestAuthorization";
+      const filePath = `${folder}/${document.fileName}`;
+
+      await mkdir(folder, {
+        baseDir: BaseDirectory.Desktop,
+        recursive: true,
+      });
+
+      await writeFile(filePath, document.bytes, {
+        baseDir: BaseDirectory.Desktop,
+        create: true,
+      });
+
+      toast({
+        title: "Guest authorization form generated",
+        description: `Saved to Desktop/${filePath}`,
+      });
+    } catch (error: any) {
+      console.error("Guest authorization PDF generation failed", error);
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Unable to generate the guest authorization form.";
+      toast({
+        variant: "destructive",
+        title: "Document generation failed",
+        description: message.includes("desktop app")
+          ? "This export is only available in the desktop app."
+          : message,
+      });
+    }
   };
 
   const handleCancelDetailsBooking = async () => {
@@ -2191,7 +2179,7 @@ export default function CalendarClient() {
       className={cn(
         "space-y-3 animate-in fade-in duration-500 pb-6",
         isFullScreen &&
-          "fixed inset-0 z-50 flex h-screen flex-col overflow-hidden bg-[hsl(var(--bg-primary))] p-0 pb-0 animate-in fade-in zoom-in-95 duration-200",
+          "fixed inset-0 z-50 flex h-[100dvh] min-h-0 flex-col overflow-hidden bg-[hsl(var(--bg-primary))] p-0 pb-0 animate-in fade-in zoom-in-95 duration-200",
       )}
     >
       {error && (
@@ -2547,15 +2535,20 @@ export default function CalendarClient() {
       <div
         className={cn(
           "grid min-w-0 gap-3 xl:grid-cols-[minmax(0,1fr)_280px]",
-          isFullScreen && "block",
+          isFullScreen && "flex min-h-0 flex-1 flex-col",
         )}
       >
-        <div className="min-w-0">
+        <div
+          className={cn(
+            "min-w-0",
+            isFullScreen && "flex min-h-0 flex-1 flex-col",
+          )}
+        >
           <Card
             className={cn(
               "overflow-hidden rounded-[28px] border border-[var(--border)] bg-[var(--bg-surface)] shadow-[0_24px_90px_-44px_rgba(15,23,42,0.4)]",
               isFullScreen &&
-                "flex min-h-0 flex-1 flex-col rounded-none border-x-0 border-b-0 shadow-none",
+                "flex h-full min-h-0 flex-1 flex-col rounded-none border-x-0 border-b-0 shadow-none",
             )}
             role="region"
             aria-label="Calendar"
@@ -2627,213 +2620,207 @@ export default function CalendarClient() {
                 </div>
               </div>
             )}
-            <ScrollArea
-              className={cn(
-                "w-full h-[calc(100vh-310px)]",
-                isFullScreen && "min-h-0 flex-1 h-full",
-              )}
-            >
-              <div
-                ref={calendarScrollRef}
-                data-calendar-mode={isOffGrid ? "off-grid" : "grid"}
+            <TooltipProvider>
+              <ScrollArea
                 className={cn(
-                  "select-none",
-                  isFullScreen ? "min-w-0 w-full" : "min-w-[1200px]",
+                  "w-full h-[calc(100vh-310px)]",
+                  isFullScreen && "min-h-0 flex-1 h-auto",
                 )}
               >
-                <div className="sticky top-0 z-30 flex border-b border-[var(--border)] bg-[hsl(var(--bg-surface))]">
-                  <div
-                    className="sticky left-0 z-40 flex w-[120px] shrink-0 items-center justify-center border-b border-r border-[var(--border)] bg-[hsl(var(--bg-surface))] px-2 text-[9px] font-bold uppercase tracking-[0.18em] text-[hsl(var(--text-secondary))] shadow-[2px_0_6px_-3px_rgba(15,23,42,0.25)]"
-                    style={{ height: `${computedHeaderHeight}px` }}
-                  >
-                    Unit
+                <div
+                  ref={calendarScrollRef}
+                  data-calendar-mode={isOffGrid ? "off-grid" : "grid"}
+                  className={cn(
+                    "select-none",
+                    isFullScreen ? "min-w-0 w-full" : "min-w-[1200px]",
+                  )}
+                >
+                  <div className="sticky top-0 z-30 flex border-b border-[var(--border)] bg-[hsl(var(--bg-surface))]">
+                    <div
+                      className="sticky left-0 z-40 flex w-[120px] shrink-0 items-center justify-center border-b border-r border-[var(--border)] bg-[hsl(var(--bg-surface))] px-2 text-[9px] font-bold uppercase tracking-[0.18em] text-[hsl(var(--text-secondary))] shadow-[2px_0_6px_-3px_rgba(15,23,42,0.25)]"
+                      style={{ height: `${computedHeaderHeight}px` }}
+                    >
+                      Unit
+                    </div>
+                    {daysInMonth.map((day) => {
+                      const dateStr = format(day, "yyyy-MM-dd");
+                      const selected = isSameDay(day, new Date());
+                      const isBlockedHeader =
+                        dateStr === AUG29_BLOCK_DATE ||
+                        isWinterClosureDate(dateStr);
+                      const dayOfWeek = day.getDay();
+                      const isSunday = dayOfWeek === 0;
+                      const isSaturday = dayOfWeek === 6;
+                      return (
+                        <div
+                          key={dateStr}
+                          data-calendar-day={dateStr}
+                          className="relative flex shrink-0 flex-col items-center justify-center border-b border-r border-[var(--border)] bg-[hsl(var(--bg-surface))] px-1 text-center"
+                          style={dayStyle}
+                        >
+                          <span
+                            className={cn(
+                              "text-[10px] font-bold uppercase tracking-[0.2em]",
+                              isSunday && "text-red-500",
+                              isSaturday && "text-blue-500",
+                              !isSunday &&
+                                !isSaturday &&
+                                "text-[hsl(var(--text-secondary))]",
+                            )}
+                          >
+                            {format(day, "EEE").toUpperCase()}
+                          </span>
+                          <span
+                            className={cn(
+                              "mt-0.5 flex h-6 w-6 items-center justify-center text-xs font-bold",
+                              selected
+                                ? "rounded-full bg-orange-500 text-white"
+                                : "text-[hsl(var(--text-primary))]",
+                            )}
+                          >
+                            {day.getDate()}
+                          </span>
+                          {isBlockedHeader && (
+                            <span className="absolute bottom-0.5 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-full bg-red-500 px-1.5 py-px text-[7px] font-bold uppercase tracking-wide text-white">
+                              Blocked
+                            </span>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
-                  {daysInMonth.map((day) => {
-                    const dateStr = format(day, "yyyy-MM-dd");
-                    const selected = isSameDay(day, new Date());
-                    const isBlockedHeader =
-                      dateStr === AUG29_BLOCK_DATE ||
-                      isWinterClosureDate(dateStr);
-                    const dayOfWeek = day.getDay();
-                    const isSunday = dayOfWeek === 0;
-                    const isSaturday = dayOfWeek === 6;
+
+                  {displayUnits.map((unit, unitIndex) => {
+                    const unitColor =
+                      unitColorMap.get(String(unit.id)) || "#94a3b8";
+                    const unitBars =
+                      bookingBarsByUnit.get(String(unit.id)) || [];
                     return (
                       <div
-                        key={dateStr}
-                        data-calendar-day={dateStr}
-                        className="relative flex shrink-0 flex-col items-center justify-center border-b border-r border-[var(--border)] bg-[hsl(var(--bg-surface))] px-1 text-center"
-                        style={dayStyle}
+                        key={unit.id}
+                        className="relative flex min-w-max border-b border-[var(--border)] last:border-b-0"
                       >
-                        <span
+                        <div
                           className={cn(
-                            "text-[10px] font-bold uppercase tracking-[0.2em]",
-                            isSunday && "text-red-500",
-                            isSaturday && "text-blue-500",
-                            !isSunday &&
-                              !isSaturday &&
-                              "text-[hsl(var(--text-secondary))]",
+                            "sticky left-0 z-20 flex w-[120px] shrink-0 flex-col items-center justify-center border-r border-[var(--border)] bg-[hsl(var(--bg-surface))] px-1.5 text-center shadow-[2px_0_6px_-3px_rgba(15,23,42,0.25)]",
+                            isFullScreen && "px-2",
                           )}
+                          style={{
+                            height: `${computedCellHeight}px`,
+                            borderLeft: `4px solid ${unitColor}`,
+                          }}
                         >
-                          {format(day, "EEE").toUpperCase()}
-                        </span>
-                        <span
-                          className={cn(
-                            "mt-0.5 flex h-6 w-6 items-center justify-center text-xs font-bold",
-                            selected
-                              ? "rounded-full bg-orange-500 text-white"
-                              : "text-[hsl(var(--text-primary))]",
-                          )}
-                        >
-                          {day.getDate()}
-                        </span>
-                        {isBlockedHeader && (
-                          <span className="absolute bottom-0.5 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-full bg-red-500 px-1.5 py-px text-[7px] font-bold uppercase tracking-wide text-white">
-                            Blocked
-                          </span>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-
-                {displayUnits.map((unit, unitIndex) => {
-                  const unitColor =
-                    unitColorMap.get(String(unit.id)) || "#94a3b8";
-                  const unitBars = bookingBarsByUnit.get(String(unit.id)) || [];
-                  return (
-                    <div
-                      key={unit.id}
-                      className="relative flex min-w-max border-b border-[var(--border)] last:border-b-0"
-                    >
-                      <div
-                        className={cn(
-                          "sticky left-0 z-20 flex w-[120px] shrink-0 flex-col items-center justify-center border-r border-[var(--border)] bg-[hsl(var(--bg-surface))] px-1.5 text-center shadow-[2px_0_6px_-3px_rgba(15,23,42,0.25)]",
-                          isFullScreen && "px-2",
-                        )}
-                        style={{
-                          height: `${computedCellHeight}px`,
-                          borderLeft: `4px solid ${unitColor}`,
-                        }}
-                      >
-                        <div className="flex w-full min-w-0 items-center justify-center gap-1">
-                          <span
-                            className="h-2 w-2 rounded-full"
-                            style={{ backgroundColor: unitColor }}
-                          />
-                          <span
-                            title={
-                              unit.unitNumber || unit.name || "Unnamed Unit"
-                            }
-                            className="min-w-0 break-words text-[11px] font-bold leading-3 text-[hsl(var(--text-primary))]"
-                          >
-                            {unit.unitNumber || unit.name || "Unnamed Unit"}
+                          <div className="flex w-full min-w-0 items-center justify-center gap-1">
+                            <span
+                              className="h-2 w-2 rounded-full"
+                              style={{ backgroundColor: unitColor }}
+                            />
+                            <span
+                              title={
+                                unit.unitNumber || unit.name || "Unnamed Unit"
+                              }
+                              className="min-w-0 break-words text-[11px] font-bold leading-3 text-[hsl(var(--text-primary))]"
+                            >
+                              {unit.unitNumber || unit.name || "Unnamed Unit"}
+                            </span>
+                          </div>
+                          <span className="mt-0.5 max-w-full truncate text-[8px] font-bold uppercase leading-none tracking-[0.16em] text-[hsl(var(--text-secondary))]">
+                            {unit.type || "UNIT"}
                           </span>
                         </div>
-                        <span className="mt-0.5 max-w-full truncate text-[8px] font-bold uppercase leading-none tracking-[0.16em] text-[hsl(var(--text-secondary))]">
-                          {unit.type || "UNIT"}
-                        </span>
-                      </div>
 
-                      <div
-                        className="relative flex"
-                        style={{
-                          ["--day-width" as any]: dayStyle?.width || "144px",
-                        }}
-                      >
-                        {daysInMonth.map((day, dayIndex) => {
-                          const dateStr = format(day, "yyyy-MM-dd");
-                          const cell = {
-                            unitId: String(unit.id),
-                            unitIndex,
-                            date: dateStr,
-                            dayIndex,
-                          };
-                          const bookingForCell = findBookingForCell(unit, day);
-                          const isBooked = Boolean(bookingForCell);
-                          const pillStatus = isBooked
-                            ? getPillStatus(bookingForCell)
-                            : null;
-                          const paymentStatus = isBooked
-                            ? getPaymentStatus(bookingForCell)
-                            : null;
-                          const isSelected = previewSelectedCellKeys.has(
-                            cellKey(cell),
-                          );
-                          const isInInquiryRange =
-                            inquiryRangeDateSet.has(dateStr);
-                          const isInquiryStart = inquiryStartDate === dateStr;
-                          const isInquiryEnd = inquiryEndDate === dateStr;
-                          const isBeingRemoved =
-                            dragAction === "remove" &&
-                            dragCellKeys.has(cellKey(cell));
-                          const isToday = isSameDay(day, new Date());
-                          const isAug29Blocked =
-                            !isBooked && isCalendarBlockedCell(unit, dateStr);
-                          const bookingPreviewAgent = isBooked
-                            ? (agents as any[]).find(
-                                (agent) =>
-                                  String(agent.id) ===
-                                  String(
-                                    bookingForCell?.agentId ||
-                                      bookingForCell?.agent_id ||
-                                      "",
-                                  ),
-                              )
-                            : null;
-                          const bookingPreviewUnit = isBooked
-                            ? getBookingUnit(bookingForCell)
-                            : null;
-                          const bookingPreviewProperty = isBooked
-                            ? bookingPreviewUnit?.propertyName ||
-                              bookingPreviewUnit?.property ||
-                              bookingPreviewUnit?.propertyLabel ||
-                              bookingPreviewUnit?.building?.name ||
-                              ""
-                            : "";
-                          const bookingPreviewCheckin =
-                            bookingForCell?.checkinDate ||
-                            bookingForCell?.checkIn ||
-                            "";
-                          const bookingPreviewCheckout =
-                            bookingForCell?.checkoutDate ||
-                            bookingForCell?.checkOut ||
-                            "";
-                          const bookingPreviewNights =
-                            bookingPreviewCheckin && bookingPreviewCheckout
-                              ? Math.max(
-                                  1,
-                                  Math.round(
-                                    (new Date(
-                                      bookingPreviewCheckout,
-                                    ).getTime() -
-                                      new Date(
-                                        bookingPreviewCheckin,
-                                      ).getTime()) /
-                                      86400000,
-                                  ),
+                        <div
+                          className="relative flex"
+                          style={{
+                            ["--day-width" as any]: dayStyle?.width || "144px",
+                          }}
+                        >
+                          {daysInMonth.map((day, dayIndex) => {
+                            const dateStr = format(day, "yyyy-MM-dd");
+                            const cell = {
+                              unitId: String(unit.id),
+                              unitIndex,
+                              date: dateStr,
+                              dayIndex,
+                            };
+                            const bookingForCell = findBookingForCell(
+                              unit,
+                              day,
+                            );
+                            const isBooked = Boolean(bookingForCell);
+                            const pillStatus = isBooked
+                              ? getPillStatus(bookingForCell)
+                              : null;
+                            const paymentStatus = isBooked
+                              ? getPaymentStatus(bookingForCell)
+                              : null;
+                            const isSelected = previewSelectedCellKeys.has(
+                              cellKey(cell),
+                            );
+                            const isInInquiryRange =
+                              inquiryRangeDateSet.has(dateStr);
+                            const isInquiryStart = inquiryStartDate === dateStr;
+                            const isInquiryEnd = inquiryEndDate === dateStr;
+                            const isBeingRemoved =
+                              dragAction === "remove" &&
+                              dragCellKeys.has(cellKey(cell));
+                            const isAug29Blocked =
+                              !isBooked && isCalendarBlockedCell(unit, dateStr);
+                            const bookingPreviewAgent = isBooked
+                              ? (agents as any[]).find(
+                                  (agent) =>
+                                    String(agent.id) ===
+                                    String(
+                                      bookingForCell?.agentId ||
+                                        bookingForCell?.agent_id ||
+                                        "",
+                                    ),
                                 )
-                              : 0;
-                          const bookingPreviewAmount = Number(
-                            bookingForCell?.totalAmount ||
-                              bookingForCell?.amount ||
-                              0,
-                          );
-                          const barForCell = unitBars.find(
-                            (bar: any) => bar.startIndex === dayIndex,
-                          );
-
-                          return (
-                            <TooltipProvider
-                              key={`${unit.id}-${dateStr}`}
-                              delayDuration={0}
-                              skipDelayDuration={0}
-                            >
-                              <Tooltip>
+                              : null;
+                            const bookingPreviewUnit = isBooked
+                              ? getBookingUnit(bookingForCell)
+                              : null;
+                            const bookingPreviewProperty = isBooked
+                              ? bookingPreviewUnit?.propertyName ||
+                                bookingPreviewUnit?.property ||
+                                bookingPreviewUnit?.propertyLabel ||
+                                bookingPreviewUnit?.building?.name ||
+                                ""
+                              : "";
+                            const bookingPreviewCheckin =
+                              bookingForCell?.checkinDate ||
+                              bookingForCell?.checkIn ||
+                              "";
+                            const bookingPreviewCheckout =
+                              bookingForCell?.checkoutDate ||
+                              bookingForCell?.checkOut ||
+                              "";
+                            const bookingPreviewNights =
+                              bookingPreviewCheckin && bookingPreviewCheckout
+                                ? Math.max(
+                                    1,
+                                    Math.round(
+                                      (new Date(
+                                        bookingPreviewCheckout,
+                                      ).getTime() -
+                                        new Date(
+                                          bookingPreviewCheckin,
+                                        ).getTime()) /
+                                        86400000,
+                                    ),
+                                  )
+                                : 0;
+                            const bookingPreviewAmount = Number(
+                              bookingForCell?.totalAmount ||
+                                bookingForCell?.amount ||
+                                0,
+                            );
+                            return (
+                              <Tooltip key={`${unit.id}-${dateStr}`}>
                                 <TooltipTrigger asChild>
                                   <div
                                     role="button"
                                     tabIndex={0}
-                                    key={`${unit.id}-${dateStr}`}
                                     className={cn(
                                       "relative flex shrink-0 items-start justify-center border-r border-[var(--border)] p-0.5 text-left transition-all duration-150",
                                       isBooked
@@ -3089,77 +3076,77 @@ export default function CalendarClient() {
                                   </TooltipContent>
                                 ) : null}
                               </Tooltip>
-                            </TooltipProvider>
-                          );
-                        })}
-                        {unitBars.map((bar: any) => {
-                          const dayWidthValue = dayStyle?.width || "144px";
-                          const dw =
-                            typeof dayWidthValue === "string"
-                              ? parseInt(dayWidthValue) || 144
-                              : 144;
-                          const barLeftDays = isOffGrid
-                            ? (bar.fracStart ?? bar.startIndex)
-                            : bar.startIndex;
-                          const barWidthDays = isOffGrid
-                            ? (bar.fracWidth ?? bar.span)
-                            : bar.span;
-                          return (
-                            <div
-                              key={`bar-${getCalendarBookingIdentity(bar.booking)}-${bar.startIndex}-${bar.endIndex}`}
-                              className="pointer-events-none absolute z-10"
-                              style={{
-                                left: barLeftDays * dw,
-                                width: barWidthDays * dw,
-                                top:
-                                  3 +
-                                  (bar.lane || 0) *
-                                    Math.max(
-                                      15,
-                                      Math.floor(
-                                        (computedCellHeight - 6) /
-                                          (bar.laneCount || 1),
+                            );
+                          })}
+                          {unitBars.map((bar: any) => {
+                            const dayWidthValue = dayStyle?.width || "144px";
+                            const dw =
+                              typeof dayWidthValue === "string"
+                                ? parseInt(dayWidthValue) || 144
+                                : 144;
+                            const barLeftDays = isOffGrid
+                              ? (bar.fracStart ?? bar.startIndex)
+                              : bar.startIndex;
+                            const barWidthDays = isOffGrid
+                              ? (bar.fracWidth ?? bar.span)
+                              : bar.span;
+                            return (
+                              <div
+                                key={`bar-${getCalendarBookingIdentity(bar.booking)}-${bar.startIndex}-${bar.endIndex}`}
+                                className="pointer-events-none absolute z-10"
+                                style={{
+                                  left: barLeftDays * dw,
+                                  width: barWidthDays * dw,
+                                  top:
+                                    3 +
+                                    (bar.lane || 0) *
+                                      Math.max(
+                                        15,
+                                        Math.floor(
+                                          (computedCellHeight - 6) /
+                                            (bar.laneCount || 1),
+                                        ),
                                       ),
-                                    ),
-                                height: Math.max(
-                                  13,
-                                  Math.floor(
-                                    (computedCellHeight - 6) /
-                                      (bar.laneCount || 1),
-                                  ) - 2,
-                                ),
-                              }}
-                            >
-                              <ReservationBar
-                                booking={bar.booking}
-                                span={bar.span}
-                                dayWidth={dayWidthValue}
-                                unitColor={
-                                  bookingLabelStyles[
-                                    getBookingLabel(bar.booking)
-                                  ]
-                                }
-                                paymentStatus={bar.paymentStatus}
-                                pillStatus={bar.pillStatus}
-                                bookingLabel={getBookingLabel(bar.booking)}
-                                isFullScreen={isFullScreen}
-                                calendarZoom={calendarZoom}
-                                clippedStart={bar.clippedStart}
-                                clippedEnd={bar.clippedEnd}
-                                selectedBookingIds={Array.from(
-                                  selectedBookings,
-                                )}
-                              />
-                            </div>
-                          );
-                        })}
+                                  height: Math.max(
+                                    13,
+                                    Math.floor(
+                                      (computedCellHeight - 6) /
+                                        (bar.laneCount || 1),
+                                    ) - 2,
+                                  ),
+                                }}
+                              >
+                                <ReservationBar
+                                  booking={bar.booking}
+                                  span={bar.span}
+                                  dayWidth={dayWidthValue}
+                                  unitColor={
+                                    bookingLabelStyles[
+                                      getBookingLabel(bar.booking)
+                                    ]
+                                  }
+                                  paymentStatus={bar.paymentStatus}
+                                  pillStatus={bar.pillStatus}
+                                  bookingLabel={getBookingLabel(bar.booking)}
+                                  isFullScreen={isFullScreen}
+                                  calendarZoom={calendarZoom}
+                                  clippedStart={bar.clippedStart}
+                                  clippedEnd={bar.clippedEnd}
+                                  selectedBookingIds={Array.from(
+                                    selectedBookings,
+                                  )}
+                                />
+                              </div>
+                            );
+                          })}
+                        </div>
                       </div>
-                    </div>
-                  );
-                })}
-              </div>
-              <ScrollBar orientation="horizontal" />
-            </ScrollArea>
+                    );
+                  })}
+                </div>
+                <ScrollBar orientation="horizontal" />
+              </ScrollArea>
+            </TooltipProvider>
 
             <div className="flex flex-wrap items-center gap-2.5 border-t border-[var(--border)] bg-[hsl(var(--bg-primary))] px-3 py-2">
               <span className="mr-1 text-[10px] font-bold uppercase tracking-wide text-[hsl(var(--text-secondary))]">
@@ -3821,7 +3808,7 @@ const ReservationBar = React.memo(function ReservationBar({
   return (
     <div
       className={cn(
-        "pointer-events-none flex h-full w-full flex-col items-start justify-center gap-0 overflow-hidden rounded-md border px-1.5 py-1 text-white shadow-none",
+        "pointer-events-none relative flex h-full w-full flex-col items-start justify-center gap-0 overflow-hidden rounded-md border px-1.5 py-1 text-white shadow-none",
         barBorderRadius,
         isLongStay && "ring-2 ring-offset-1 ring-white/70",
         isSelected && "ring-2 ring-orange-300",

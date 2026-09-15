@@ -7,6 +7,7 @@ export type BookingBatchAttempt = {
     checkoutDate?: string;
   } | null;
   totalAmount?: number;
+  commissionError?: string | null;
 };
 
 export type BookingBatchFailure = {

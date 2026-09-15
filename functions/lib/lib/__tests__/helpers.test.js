@@ -49,49 +49,31 @@ describe("stableStringify helper", () => {
   });
 });
 describe("computeAgentCommission logic", () => {
-  it("computes percentage commission correctly", () => {
+  it("computes base commission from the base unit rate and nights", () => {
     const mockAgent = {
       id: "agent1",
-      name: "Agent One",
-      email: "",
-      phone: "",
-      commissionType: "percentage",
-      commissionRate: 10,
-      totalBookings: 0,
-      totalCommissions: 0,
-      joinDate: "",
-      status: "active",
-    };
-    const baseRate = 5000;
-    const totalPaid = 5500;
-    const commission = (0, route_helpers_1.computeAgentCommission)(
-      mockAgent,
-      baseRate,
-      totalPaid,
-    );
-    expect(commission).toBe(500); // 10% of 5000
-  });
-  it("computes fixed commission markup correctly", () => {
-    const mockAgent = {
-      id: "agent2",
-      name: "Agent Two",
-      email: "",
-      phone: "",
       commissionType: "fixed_commission",
-      commissionRate: 0,
-      totalBookings: 0,
-      totalCommissions: 0,
-      joinDate: "",
-      status: "active",
     };
-    const baseRate = 4500;
-    const totalPaid = 5200;
     const commission = (0, route_helpers_1.computeAgentCommission)(
       mockAgent,
-      baseRate,
-      totalPaid,
+      { checkinDate: "2026-10-01", checkoutDate: "2026-10-04" },
+      { rate: 2000, capacity: 2 },
     );
-    expect(commission).toBe(700); // totalPaid - baseRate
+    expect(commission).toBe(1500);
+  });
+
+  it("uses the minimum extra guest rate and calculates extra guests per night", () => {
+    const commission = (0, route_helpers_1.computeAgentCommission)(
+      { id: "agent2" },
+      {
+        checkinDate: "2026-10-01",
+        checkoutDate: "2026-10-04",
+        adults: 4,
+        children: 0,
+      },
+      { rate: 1500, capacity: 2, extraGuestFee: 500 },
+    );
+    expect(commission).toBe(1200);
   });
 });
 //# sourceMappingURL=helpers.test.js.map

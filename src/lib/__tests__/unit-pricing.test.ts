@@ -30,4 +30,9 @@ describe("unit fixed markup pricing", () => {
       1800,
     );
   });
+
+  it("never lets negative markup reduce the unit rate", () => {
+    expect(getUnitMarkup({ basePrice: 1800, markup: -500 })).toBe(0);
+    expect(getUnitFinalPrice({ basePrice: 1800, markup: -500 })).toBe(1800);
+  });
 });

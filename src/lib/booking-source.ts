@@ -15,6 +15,13 @@ export const BOOKING_SOURCE_LEGEND = {
 
 export type BookingSourceLabel = keyof typeof BOOKING_SOURCE_LEGEND;
 
+export const BOOKING_STATUS_OPTIONS = [
+  { value: "Reserved", label: "Reserved" },
+  { value: "Pending", label: "Pending" },
+  { value: "Awaiting Payment", label: "Awaiting Payment" },
+  { value: "Fully Paid", label: "Fully Paid" },
+] as const;
+
 const aliases: Record<string, BookingSourceLabel> = {
   "BOOKING.COM": "BOOKING",
   BOOKINGCOM: "BOOKING",
@@ -29,7 +36,9 @@ const aliases: Record<string, BookingSourceLabel> = {
   AWAITING_PAYMENT: "AWAITING PAYMENT",
 };
 
-export const getBookingSourceLabel = (bookingOrSource: any): BookingSourceLabel => {
+export const getBookingSourceLabel = (
+  bookingOrSource: any,
+): BookingSourceLabel => {
   const candidates =
     bookingOrSource && typeof bookingOrSource === "object"
       ? [
@@ -53,6 +62,18 @@ export const getBookingSourceLabel = (bookingOrSource: any): BookingSourceLabel 
 
 export const getBookingSourceColor = (bookingOrSource: any) =>
   BOOKING_SOURCE_LEGEND[getBookingSourceLabel(bookingOrSource)];
+
+export const getBookingStatusLabel = (booking: any): BookingSourceLabel => {
+  const raw = String(booking?.bookingStatus || "")
+    .trim()
+    .toUpperCase();
+  if (raw === "RESERVED") return "RESERVE";
+  if (raw === "PENDING") return "PENDING";
+  if (raw === "AWAITING PAYMENT" || raw === "AWAITING_PAYMENT")
+    return "AWAITING PAYMENT";
+  if (raw === "FULLY PAID" || raw === "FULLY_PAID") return "FULLY PAID";
+  return getBookingSourceLabel(booking);
+};
 
 export const getBookingSourceDisplayName = (bookingOrSource: any) => {
   const label = getBookingSourceLabel(bookingOrSource);

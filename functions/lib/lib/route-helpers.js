@@ -89,6 +89,7 @@ exports.computeExpenseTotals = computeExpenseTotals;
 exports.stripUndefinedFields = stripUndefinedFields;
 exports.buildExpenseFirestoreDocument = buildExpenseFirestoreDocument;
 exports.computeAgentCommission = computeAgentCommission;
+exports.syncAgentCommission = syncAgentCommission;
 exports.resolveBookingPaymentStatus = resolveBookingPaymentStatus;
 exports.resolveSecurityDepositStatus = resolveSecurityDepositStatus;
 exports.recomputeBookingPayment = recomputeBookingPayment;
@@ -399,21 +400,25 @@ function isLegacySheetBookingPlaceholderId(bookingId) {
 }
 async function findBookingConflict(newBooking, excludeBookingId) {
   const adminDb = getDb();
-  const snapshot = await adminDb
-    .collection("bookings")
-    .where("unitId", "==", newBooking.unitId)
-    .where("checkoutDate", ">", newBooking.checkinDate)
-    .get();
+  const snapshot = await adminDb.collection("bookings").get();
   if (snapshot.empty) return null;
+  const checkinDate = String(newBooking.checkinDate || "").slice(0, 10);
+  const checkoutDate = String(newBooking.checkoutDate || "").slice(0, 10);
+  const requestedUnitId = String(newBooking.unitId || "")
+    .trim()
+    .toLowerCase();
   return (
     snapshot.docs
       .map((doc) => ({ id: doc.id, ...doc.data() }))
-      .filter((booking) => !isLegacySheetBookingPlaceholder(booking))
       .find(
         (booking) =>
           String(booking.id || booking.bookingId || "") !==
             String(excludeBookingId || "") &&
-          booking.checkinDate < newBooking.checkoutDate,
+          String(booking.unitId || "")
+            .trim()
+            .toLowerCase() === requestedUnitId &&
+          String(booking.checkinDate || "").slice(0, 10) < checkoutDate &&
+          String(booking.checkoutDate || "").slice(0, 10) > checkinDate,
       ) || null
   );
 }
@@ -453,21 +458,27 @@ async function reserveBookingOccupancy(adminDb, bookingRef, booking) {
   await adminDb.runTransaction(async (transaction) => {
     const [lockSnapshots, bookingSnapshot] = await Promise.all([
       transaction.getAll(...lockRefs),
-      transaction.get(
-        adminDb
-          .collection("bookings")
-          .where("unitId", "==", booking.unitId)
-          .where("checkoutDate", ">", booking.checkinDate),
-      ),
+      transaction.get(adminDb.collection("bookings")),
     ]);
     const conflict = bookingSnapshot.docs
       .map((doc) => ({ id: doc.id, ...doc.data() }))
-      .filter((existing) => !isLegacySheetBookingPlaceholder(existing))
-      .find((existing) => existing.checkinDate < booking.checkoutDate);
+      .find(
+        (existing) =>
+          String(existing.unitId || "")
+            .trim()
+            .toLowerCase() ===
+            String(booking.unitId || "")
+              .trim()
+              .toLowerCase() &&
+          String(existing.checkinDate || "").slice(0, 10) <
+            String(booking.checkoutDate || "").slice(0, 10) &&
+          String(existing.checkoutDate || "").slice(0, 10) >
+            String(booking.checkinDate || "").slice(0, 10) &&
+          String(existing.id || existing.bookingId || "") !== bookingRef.id,
+      );
     const locked = lockSnapshots.find(
       (snapshot) =>
-        snapshot.exists &&
-        !isLegacySheetBookingPlaceholderId(snapshot.data()?.bookingId),
+        snapshot.exists && String(snapshot.data()?.bookingId || "") !== "",
     );
     if (conflict || locked) {
       const error = new Error("Booking conflict detected.");
@@ -515,17 +526,24 @@ async function updateBookingOccupancy(
     ]);
     const conflict = candidates.docs
       .map((doc) => ({ id: doc.id, ...doc.data() }))
-      .filter((existing) => !isLegacySheetBookingPlaceholder(existing))
       .find(
         (existing) =>
           String(existing.id || existing.bookingId || "") !== bookingRef.id &&
-          existing.checkinDate < after.checkoutDate,
+          String(existing.unitId || "")
+            .trim()
+            .toLowerCase() ===
+            String(after.unitId || "")
+              .trim()
+              .toLowerCase() &&
+          String(existing.checkinDate || "").slice(0, 10) <
+            String(after.checkoutDate || "").slice(0, 10) &&
+          String(existing.checkoutDate || "").slice(0, 10) >
+            String(after.checkinDate || "").slice(0, 10),
       );
     const locked = newLocks.find(
       (snapshot) =>
         snapshot.exists &&
-        String(snapshot.data()?.bookingId || "") !== bookingRef.id &&
-        !isLegacySheetBookingPlaceholderId(snapshot.data()?.bookingId),
+        String(snapshot.data()?.bookingId || "") !== bookingRef.id,
     );
     if (conflict || locked) {
       const error = new Error("Booking conflict detected.");
@@ -760,15 +778,137 @@ function computeExpenseTotals(normalized) {
     calculatedTotal,
   };
 }
-function computeAgentCommission(agent, baseRate, totalAmountPaid) {
-  if (!agent) return 0;
-  if (agent.commissionType === "fixed_commission") {
-    return Math.max(0, totalAmountPaid - baseRate);
+function computeAgentCommission(agent, booking, unit) {
+  if (!agent || !booking || !unit) return 0;
+  const checkin = new Date(
+    `${String(booking.checkinDate || "").slice(0, 10)}T00:00:00Z`,
+  );
+  const checkout = new Date(
+    `${String(booking.checkoutDate || "").slice(0, 10)}T00:00:00Z`,
+  );
+  if (
+    Number.isNaN(checkin.getTime()) ||
+    Number.isNaN(checkout.getTime()) ||
+    checkout <= checkin
+  ) {
+    return 0;
   }
-  if (agent.commissionType === "percentage") {
-    return Math.max(0, baseRate * (toNumber(agent.commissionRate) / 100));
+  const nights = Math.round(
+    (checkout.getTime() - checkin.getTime()) / 86400000,
+  );
+  const baseUnitRate = toNumber(unit.basePrice ?? unit.rate);
+  const capacity = toNumber(unit.capacity ?? unit.baseOccupancy);
+  const extraGuestCount = Math.max(
+    0,
+    toNumber(booking.adults) + toNumber(booking.children) - capacity,
+  );
+  const extraGuestRateValue = Number(unit.extraGuestRate ?? unit.extraGuestFee);
+  const extraGuestRate =
+    Number.isFinite(extraGuestRateValue) && extraGuestRateValue >= 300
+      ? extraGuestRateValue
+      : 300;
+  const baseCommission = Math.max(0, baseUnitRate - 1500) * nights;
+  const extraGuestCommission =
+    Math.max(0, extraGuestRate - 300) * extraGuestCount * nights;
+  return Math.round((baseCommission + extraGuestCommission) * 100) / 100;
+}
+async function syncAgentCommission(bookingId, booking, unit, options = {}) {
+  const db = getDb();
+  const id = String(
+    bookingId || booking?.id || booking?.bookingId || "",
+  ).trim();
+  if (!id) throw new Error("bookingId is required for commission sync");
+
+  const existingSnapshot = await db
+    .collection("expenses")
+    .where("bookingId", "==", id)
+    .get();
+  const commissionDocs = existingSnapshot.docs.filter(
+    (doc) => doc.data()?.category === "Agent Commission",
+  );
+  const agentId = String(booking?.agentId || "").trim();
+  const desiredAmount =
+    agentId && unit
+      ? computeAgentCommission(options.agent || {}, booking, unit)
+      : 0;
+
+  if (!agentId || desiredAmount <= 0) {
+    await Promise.all(
+      commissionDocs.map((doc) =>
+        doc.ref.set(
+          stripUndefinedFields({
+            commissionStatus: "cancelled",
+            status: "Cancelled",
+            updatedAt: new Date().toISOString(),
+          }),
+          { merge: true },
+        ),
+      ),
+    );
+    return { id: null, amount: 0, status: "cancelled" };
   }
-  return 0;
+
+  const canonicalId = `agent-commission-${id}`;
+  const legacyId = `agent-commission-${id}-${agentId}`;
+  const primary =
+    commissionDocs.find((doc) => doc.id === canonicalId) ||
+    commissionDocs.find((doc) => doc.id === legacyId) ||
+    commissionDocs[0];
+  const primaryRef = primary?.ref || db.collection("expenses").doc(canonicalId);
+  const previous = primary?.data() || {};
+  const agent = options.agent || {};
+  const guestName =
+    `${booking?.guestFirstName || ""} ${booking?.guestLastName || ""}`.trim();
+  const payload = stripUndefinedFields({
+    id: primaryRef.id,
+    uid: booking?.uid,
+    title: `Commission - ${agent.name || agent.fullName || booking?.agentName || "Agent"} - ${guestName}`,
+    category: "Agent Commission",
+    frequency: "one_time",
+    amountMode: "total",
+    amount: desiredAmount,
+    date: String(booking?.checkinDate || "").slice(0, 10),
+    unitId: String(booking?.unitId || ""),
+    unitIds: [String(booking?.unitId || "")].filter(Boolean),
+    unitName: unit?.name || unit?.unitNumber || booking?.unitName || "",
+    agentId,
+    agentName: agent.name || agent.fullName || booking?.agentName || "",
+    bookingId: id,
+    commissionStatus:
+      previous.commissionStatus === "cancelled"
+        ? "on hold"
+        : previous.commissionStatus || "on hold",
+    status:
+      previous.status === "Cancelled" ? "Paid" : previous.status || "Paid",
+    paymentMethod: previous.paymentMethod || "CASH",
+    notes: `Auto-generated commission for ${guestName}`,
+    createdAt: previous.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    source: "booking-save",
+    managedByBooking: true,
+  });
+  await primaryRef.set(payload, { merge: true });
+
+  await Promise.all(
+    commissionDocs
+      .filter((doc) => doc.ref.path !== primaryRef.path)
+      .map((doc) =>
+        doc.ref.set(
+          stripUndefinedFields({
+            commissionStatus: "cancelled",
+            status: "Cancelled",
+            supersededBy: primaryRef.id,
+            updatedAt: new Date().toISOString(),
+          }),
+          { merge: true },
+        ),
+      ),
+  );
+  return {
+    id: primaryRef.id,
+    amount: desiredAmount,
+    status: payload.commissionStatus,
+  };
 }
 function resolveBookingPaymentStatus(data, fallback) {
   const raw = String(
@@ -781,11 +921,40 @@ function resolveBookingPaymentStatus(data, fallback) {
       fallback?.bookingPayment?.status ??
       fallback?.bookingPayment?.paymentStatus ??
       "Unpaid",
-  )
-    .trim()
-    .toLowerCase();
-  if (raw === "paid") return "Paid";
-  if (raw === "partial") return "Partial";
+  ).trim();
+  if (!raw) return "Unpaid";
+
+  const normalized = raw.toLowerCase().replace(/\s+/g, " ");
+  if (
+    normalized.includes("partial") ||
+    normalized === "partially paid" ||
+    normalized === "partial payment"
+  ) {
+    return "Partial";
+  }
+  if (normalized.includes("refund") || normalized.includes("refunded")) {
+    return "Refunded";
+  }
+  if (
+    normalized.includes("unpaid") ||
+    normalized === "pending" ||
+    normalized === "pending payment" ||
+    normalized === "not paid"
+  ) {
+    return "Unpaid";
+  }
+  if (
+    normalized === "paid" ||
+    normalized === "fully paid" ||
+    normalized === "full payment" ||
+    normalized === "full paid" ||
+    normalized.includes("paid") ||
+    normalized.includes("received") ||
+    normalized.includes("held") ||
+    normalized.includes("active")
+  ) {
+    return "Paid";
+  }
   return "Unpaid";
 }
 function resolveSecurityDepositStatus(data, fallback) {

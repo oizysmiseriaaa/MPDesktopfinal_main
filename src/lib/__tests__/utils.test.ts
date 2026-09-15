@@ -8,6 +8,7 @@ import {
   normalizeSecurityDepositRecord,
   normalizeBookingSecurityDepositRecords,
   normalizeSecurityDepositsFromBookings,
+  normalizeSecurityDepositLedgerRecords,
   summarizeNormalizedSecurityDeposits,
   summarizeSecurityDeposits,
   getSecurityDepositDate,
@@ -19,6 +20,7 @@ import {
   addLocalDays,
   todayLocalDateInput,
   tomorrowLocalDateInput,
+  normalizeBookingPaymentState,
 } from "../utils-app";
 
 // Covers shared currency, date, and revenue calculations.
@@ -35,6 +37,22 @@ describe("getDaysInMonth helper", () => {
     expect(getDaysInMonth(1, 2024)).toBe(29); // February leap year
     expect(getDaysInMonth(1, 2023)).toBe(28); // February regular year
     expect(getDaysInMonth(0, 2024)).toBe(31); // January
+  });
+});
+
+describe("normalizeBookingPaymentState helper", () => {
+  it("treats exact paid and fully paid aliases as Paid without matching unpaid", () => {
+    expect(normalizeBookingPaymentState("Paid")).toBe("Paid");
+    expect(normalizeBookingPaymentState("Fully Paid")).toBe("Paid");
+    expect(normalizeBookingPaymentState("Unpaid")).toBe("Unpaid");
+    expect(normalizeBookingPaymentState("Partial")).toBe("Partial");
+    expect(normalizeBookingPaymentState("Refunded")).toBe("Refunded");
+  });
+
+  it("preserves exact state matching rather than substring matching", () => {
+    expect(normalizeBookingPaymentState("unpaid")).toBe("Unpaid");
+    expect(normalizeBookingPaymentState("paid")).toBe("Paid");
+    expect(normalizeBookingPaymentState("partial")).toBe("Partial");
   });
 });
 
@@ -327,6 +345,75 @@ describe("normalizeSecurityDepositsFromBookings helper", () => {
 });
 
 describe("summarizeNormalizedSecurityDeposits helper", () => {
+  it("merges ledger records with legacy booking deposits without duplicating bookings", () => {
+    const records = normalizeSecurityDepositLedgerRecords(
+      [
+        {
+          id: "deposit-1",
+          bookingId: "booking-1",
+          unitId: "unit-1",
+          type: "receive",
+          amount: 1500,
+          status: "Paid",
+          paidAt: "2026-09-03",
+        },
+        {
+          id: "deposit-2",
+          bookingId: "booking-1",
+          unitId: "unit-1",
+          type: "receive",
+          amount: 500,
+          status: "Refunded",
+          paidAt: "2026-09-03",
+          updatedAt: "2026-09-05",
+        },
+      ],
+      [
+        {
+          id: "booking-1",
+          unitId: "unit-1",
+          unitName: "438B",
+          guestFirstName: "Guest",
+          guestLastName: "One",
+          checkinDate: "2026-09-03",
+          securityDeposit: { amount: 1500, status: "Paid" },
+        },
+        {
+          id: "booking-2",
+          unitId: "unit-2",
+          unitName: "447B",
+          guestFirstName: "Legacy",
+          guestLastName: "Guest",
+          checkinDate: "2026-09-04",
+          securityDeposit: { amount: 1000, status: "Unpaid" },
+        },
+      ],
+    );
+
+    expect(records).toHaveLength(3);
+    expect(records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "deposit-1",
+          bookingId: "booking-1",
+          depositAmount: 1500,
+          status: "Paid",
+          depositDate: expect.stringContaining("2026-09-03"),
+        }),
+        expect.objectContaining({
+          id: "deposit-2",
+          bookingId: "booking-1",
+          refundAmount: 500,
+          depositAmount: 0,
+          depositDate: expect.stringContaining("2026-09-05"),
+        }),
+      ]),
+    );
+    expect(records.some((record) => record.bookingId === "booking-2")).toBe(
+      true,
+    );
+  });
+
   it("computes collected, refunded, active held, and unpaid from one dataset", () => {
     const records = [
       {

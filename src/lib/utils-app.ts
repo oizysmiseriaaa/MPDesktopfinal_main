@@ -130,20 +130,41 @@ export function getBookingLabel(booking?: any): string {
   return checkin.date || "—";
 }
 
-export function normalizeBookingDepositStatus(rawStatus: any) {
-  const status = String(rawStatus || "")
-    .trim()
-    .toLowerCase();
+export function normalizeBookingPaymentState(rawStatus: any): string {
+  const value = String(rawStatus ?? "").trim();
+  if (!value) return "Unpaid";
+
+  const status = value.toLowerCase().replace(/\s+/g, " ");
+
   if (status.includes("partial")) return "Partial";
-  if (status.includes("unpaid")) return "Unpaid";
+  if (status.includes("refund") || status.includes("refunded"))
+    return "Refunded";
   if (
+    status.includes("unpaid") ||
+    status === "pending" ||
+    status === "pending payment" ||
+    status === "not paid"
+  ) {
+    return "Unpaid";
+  }
+  if (
+    status === "paid" ||
+    status === "fully paid" ||
+    status === "full payment" ||
+    status === "full paid" ||
     status.includes("paid") ||
     status.includes("received") ||
     status.includes("held") ||
     status.includes("active")
-  )
+  ) {
     return "Paid";
+  }
+
   return "Unpaid";
+}
+
+export function normalizeBookingDepositStatus(rawStatus: any) {
+  return normalizeBookingPaymentState(rawStatus);
 }
 
 export type NormalizedSecurityDeposit = {
@@ -182,7 +203,9 @@ function firstPositiveNumber(...values: unknown[]): number {
  * (the refund reduces Active Held, not the collected total).
  */
 export function normalizeDepositDisplayStatus(rawStatus: string): string {
-  const s = String(rawStatus || "").trim().toLowerCase();
+  const s = String(rawStatus || "")
+    .trim()
+    .toLowerCase();
   if (s.includes("refund")) return "Paid";
   return normalizeBookingDepositStatus(rawStatus);
 }
@@ -280,9 +303,14 @@ export function normalizeSecurityDepositsFromBookings(bookings: any[] = []) {
       const refundCompleted =
         (rawRefundStatus === "" && refundAmount > 0) ||
         (rawRefundStatus !== "" &&
-          !["pending", "processing", "unpaid", "void", "cancelled", "failed"].some(
-            (k) => rawRefundStatus.includes(k),
-          ));
+          ![
+            "pending",
+            "processing",
+            "unpaid",
+            "void",
+            "cancelled",
+            "failed",
+          ].some((k) => rawRefundStatus.includes(k)));
       const effectiveRefundAmount =
         refundCompleted && refundAmount > 0 ? refundAmount : 0;
 
@@ -343,6 +371,89 @@ export function normalizeSecurityDepositsFromBookings(bookings: any[] = []) {
 }
 
 /**
+ * Uses security-deposits ledger records as the canonical report source while
+ * retaining booking-embedded deposits that predate the ledger collection.
+ */
+export function normalizeSecurityDepositLedgerRecords(
+  ledgerRecords: any[] = [],
+  bookings: any[] = [],
+) {
+  const bookingById = new Map(
+    (Array.isArray(bookings) ? bookings : []).map((booking) => [
+      String(booking?.id || booking?.bookingId || ""),
+      booking,
+    ]),
+  );
+  const normalizedLedger = (
+    Array.isArray(ledgerRecords) ? ledgerRecords : []
+  ).map((record) => {
+    const booking = bookingById.get(String(record?.bookingId || ""));
+    const storedType = String(record?.type || record?.transactionType || "")
+      .trim()
+      .toLowerCase();
+    const rawStatus = String(record?.status || "").trim();
+    const isRefundedReceive =
+      storedType === "receive" && rawStatus.toLowerCase().includes("refund");
+    const type = isRefundedReceive ? "refund" : storedType || "receive";
+    const amount = Number(record?.amount ?? record?.depositAmount ?? 0);
+    const safeAmount = Number.isFinite(amount) ? Math.max(0, amount) : 0;
+    const status = normalizeDepositDisplayStatus(
+      rawStatus || (type === "refund" ? "Refunded" : "Paid"),
+    );
+    const bookingRecord = booking
+      ? normalizeSecurityDepositsFromBookings([booking])[0]
+      : null;
+    const guestName = record?.guestName || bookingRecord?.guestName || "—";
+    const unitName =
+      record?.unitName || bookingRecord?.unitName || record?.unitId || "—";
+    const transactionDate = getSecurityDepositDate({
+      depositDate: record?.depositDate,
+      paymentDate: record?.paymentDate,
+      refundDate: isRefundedReceive
+        ? record?.refundDate ||
+          record?.refundPaidAt ||
+          record?.updatedAt ||
+          record?.paidAt
+        : record?.refundDate,
+      refundPaidAt: isRefundedReceive
+        ? record?.refundPaidAt || record?.refundDate
+        : record?.refundPaidAt,
+      updatedAt: isRefundedReceive ? record?.updatedAt : undefined,
+      paidAt: record?.paidAt,
+      timestamp: record?.timestamp,
+      recordedAt: record?.recordedAt,
+      createdAt: record?.createdAt,
+      date: record?.date,
+    });
+    const depositDate = transactionDate || bookingRecord?.depositDate || "";
+    return {
+      ...(bookingRecord || {}),
+      ...record,
+      id: String(record?.id || ""),
+      bookingId: String(record?.bookingId || bookingRecord?.bookingId || ""),
+      guestName,
+      unitId: record?.unitId || bookingRecord?.unitId || "—",
+      unitName,
+      depositAmount: type === "refund" ? 0 : safeAmount,
+      refundAmount: type === "refund" ? safeAmount : 0,
+      refundStatus: type === "refund" ? rawStatus : record?.refundStatus,
+      status,
+      depositStatus: status,
+      transactionType:
+        type === "refund" ? "Deposit Refunded" : "Deposit Received",
+      depositDate,
+    };
+  });
+  const ledgerBookingIds = new Set(
+    normalizedLedger.map((record) => record.bookingId).filter(Boolean),
+  );
+  const legacyBookingRecords = normalizeSecurityDepositsFromBookings(
+    bookings,
+  ).filter((record) => !ledgerBookingIds.has(record.bookingId));
+  return [...normalizedLedger, ...legacyBookingRecords];
+}
+
+/**
  * Summary metric for the normalized bookings-based security deposit dataset.
  * - Total Collected: sum of deposit amounts for Paid bookings.
  * - Total Refunded:  sum of completed refund amounts (never the original deposit).
@@ -359,9 +470,14 @@ export function summarizeNormalizedSecurityDeposits(records: any[] = []) {
     if (amount <= 0) return false;
     const rs = String(r.refundStatus || "").toLowerCase();
     if (rs === "") return true;
-    return !["pending", "processing", "unpaid", "void", "cancelled", "failed"].some(
-      (k) => rs.includes(k),
-    );
+    return ![
+      "pending",
+      "processing",
+      "unpaid",
+      "void",
+      "cancelled",
+      "failed",
+    ].some((k) => rs.includes(k));
   };
   const totalRefunded = rows
     .filter(isCompletedRefund)
@@ -372,7 +488,6 @@ export function summarizeNormalizedSecurityDeposits(records: any[] = []) {
     .reduce((s, r) => s + (Number(r.depositAmount) || 0), 0);
   return { totalCollected, totalRefunded, activeHeld, unpaidDeposits };
 }
-
 
 export type SecurityDepositFilters = {
   month?: number;
@@ -604,10 +719,7 @@ export function normalizeSecurityDepositRecord(deposit: any = {}) {
     deposit.ref ||
     "";
   const processedBy =
-    deposit.processedBy ||
-    deposit.processed_by ||
-    deposit.user ||
-    "";
+    deposit.processedBy || deposit.processed_by || deposit.user || "";
   const notes =
     deposit.notes ||
     deposit.description ||

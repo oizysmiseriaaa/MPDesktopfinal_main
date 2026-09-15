@@ -96,8 +96,11 @@ export default function AgentsClient() {
 
   const getAgentCommissionSummary = (agentId: string) => {
     const commissions = commissionsByAgent[agentId] || [];
-    const monthlyCommissions = commissions.filter((c) =>
-      c.date?.startsWith(monthKey),
+    const monthlyCommissions = commissions.filter(
+      (c) =>
+        c.date?.startsWith(monthKey) &&
+        c.commissionStatus !== "cancelled" &&
+        c.status !== "Cancelled",
     );
     const onHold = monthlyCommissions
       .filter((c) => c.commissionStatus !== "released")

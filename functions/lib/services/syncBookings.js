@@ -384,7 +384,9 @@ function collectSheetTotals(values, startRowIndex, unitColumns) {
   const totals = new Map();
   if (!selected.row) return totals;
   for (const unitColumn of unitColumns) {
-    const amount = parseCalendarNumberValue(selected.row[unitColumn.rateColIndex]);
+    const amount = parseCalendarNumberValue(
+      selected.row[unitColumn.rateColIndex],
+    );
     if (amount > 0) {
       totals.set(unitColumn.unitId, amount);
     }
@@ -490,7 +492,9 @@ function parseCalendarWorksheetBookings(values, worksheetTitle, unitLookup) {
         currentBlock.rowIndices.push(rowIndex);
         if (
           currentBlock.paymentStatus === "Unpaid" &&
-          (sourceStatus.includes("fully paid") || sourceStatus === "paid")
+          (sourceStatus.includes("fully paid") ||
+            sourceStatus === "paid" ||
+            sourceStatus === "full paid")
         ) {
           currentBlock.paymentStatus = "Paid";
         }
@@ -518,9 +522,18 @@ function parseCalendarWorksheetBookings(values, worksheetTitle, unitLookup) {
       }
       previousInvalidNumericGuest = "";
       const sourceStatus = sourceCell.toLowerCase();
-      if (sourceStatus.includes("fully paid") || sourceStatus === "paid") {
+      if (
+        sourceStatus.includes("fully paid") ||
+        sourceStatus === "paid" ||
+        sourceStatus === "full paid"
+      ) {
         parsedCell.paymentStatus = "Paid";
-      } else if (sourceStatus.includes("awaiting") || sourceStatus.includes("unpaid")) {
+      } else if (
+        sourceStatus.includes("awaiting") ||
+        sourceStatus.includes("unpaid") ||
+        sourceStatus === "pending" ||
+        sourceStatus === "pending payment"
+      ) {
         parsedCell.paymentStatus = "Unpaid";
       }
       if (rate > 0) parsedCell.amountValues.push(rate);
@@ -1081,14 +1094,19 @@ async function syncBookingsFromSheet(options = {}) {
         docId = parsed.bookingIdFromSheet;
       } else if (parsed.bookingIdFromSheet) {
         docId = parsed.bookingIdFromSheet;
-      } else if (sourceSyncKey && bookingLookup.bySourceKey.has(sourceSyncKey)) {
+      } else if (
+        sourceSyncKey &&
+        bookingLookup.bySourceKey.has(sourceSyncKey)
+      ) {
         existing = bookingLookup.bySourceKey.get(sourceSyncKey);
         docId = String(existing.id || existing.bookingId);
       } else if (
         options.legacyWorksheetName === sourceWorksheet &&
         bookingLookup.bySourceKey.has(buildLegacyBookingSourceSyncKey(parsed))
       ) {
-        existing = bookingLookup.bySourceKey.get(buildLegacyBookingSourceSyncKey(parsed));
+        existing = bookingLookup.bySourceKey.get(
+          buildLegacyBookingSourceSyncKey(parsed),
+        );
         docId = String(existing.id || existing.bookingId);
       } else if (syncKey && bookingLookup.bySyncKey.has(syncKey)) {
         existing = bookingLookup.bySyncKey.get(syncKey);
@@ -1146,7 +1164,8 @@ async function syncBookingsFromSheet(options = {}) {
         stats.imported += 1;
         bookingLookup.byId.set(docId, createPayload);
         if (syncKey) bookingLookup.bySyncKey.set(syncKey, createPayload);
-        if (sourceSyncKey) bookingLookup.bySourceKey.set(sourceSyncKey, createPayload);
+        if (sourceSyncKey)
+          bookingLookup.bySourceKey.set(sourceSyncKey, createPayload);
         continue;
       }
       const changedFields = pickChangedFields(existing, payload, syncFieldKeys);
@@ -1199,7 +1218,8 @@ async function syncBookingsFromSheet(options = {}) {
     worksheetTitle: sheetRead.worksheetTitle,
     rowsProcessed,
     validationMismatches,
-    rateOnlyRowsRejected: typeof rateOnlyRowsRejected === "number" ? rateOnlyRowsRejected : 0,
+    rateOnlyRowsRejected:
+      typeof rateOnlyRowsRejected === "number" ? rateOnlyRowsRejected : 0,
     alreadyExisting: stats.alreadyExisting || 0,
     invalidRows: stats.invalidRows || 0,
     changesRequiringReview: stats.changesRequiringReview || 0,

@@ -26,6 +26,7 @@
 
 # Local representative signature used only when generating customer documents.
 /public/rep_sig.png
+/public/name_signature.png
 
 # debug
 npm-debug.log*

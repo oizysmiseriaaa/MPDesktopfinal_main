@@ -32,8 +32,9 @@ import {
   getBookingSourceColor,
   getBookingSourceDisplayName,
   getBookingSourceLabel,
+  getBookingStatusLabel,
+  BOOKING_STATUS_OPTIONS,
 } from "@/lib/booking-source";
-
 
 // Handles booking details and document generation.
 
@@ -353,6 +354,9 @@ export function BookingDetailsDialog({
       )
     : "N/A";
   const selectedSourceColor = getBookingSourceColor(selectedSource);
+  const selectedStatusColor = getBookingSourceColor(
+    getBookingStatusLabel(detailsBooking),
+  );
 
   const toComparableUnitValues = (unit: any) =>
     [unit?.id, unit?.unitNumber, unit?.name]
@@ -370,8 +374,6 @@ export function BookingDetailsDialog({
       ) || null
     );
   };
-
-
 
   // Syncs security deposit data with canonical collection.
   const liveDepositSummary = useMemo(() => {
@@ -616,6 +618,33 @@ export function BookingDetailsDialog({
                     {bookingSourceOptions.map((source) => (
                       <option key={source.value} value={source.value}>
                         {source.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <Label>Booking Status</Label>
+                <div className="relative">
+                  <span
+                    aria-hidden="true"
+                    className="pointer-events-none absolute left-3 top-1/2 h-2.5 w-2.5 -translate-y-1/2 rounded-full"
+                    style={{ backgroundColor: selectedStatusColor }}
+                  />
+                  <select
+                    className="w-full h-10 border rounded-md py-0 pl-8 pr-3"
+                    value={detailsBooking?.bookingStatus || "Reserved"}
+                    onChange={(e) =>
+                      setDetailsBooking({
+                        ...detailsBooking,
+                        bookingStatus: e.target.value,
+                      })
+                    }
+                  >
+                    {BOOKING_STATUS_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
                       </option>
                     ))}
                   </select>
@@ -1300,7 +1329,6 @@ export function BookingDetailsDialog({
                     color: "black",
                   }}
                 >
-
                   <div
                     style={{
                       display: "flex",
@@ -1372,7 +1400,6 @@ export function BookingDetailsDialog({
                     📋 QUOTATION
                   </h1>
 
-
                   <div
                     style={{
                       display: "grid",
@@ -1409,7 +1436,6 @@ export function BookingDetailsDialog({
                       </p>
                     </div>
                   </div>
-
 
                   <table
                     style={{
@@ -1527,7 +1553,6 @@ export function BookingDetailsDialog({
                     </tbody>
                   </table>
 
-
                   <div
                     style={{
                       display: "flex",
@@ -1548,7 +1573,6 @@ export function BookingDetailsDialog({
                       {formatCurrency(getDetailsDisplayedTotalAmount())}
                     </p>
                   </div>
-
 
                   <p
                     style={{
@@ -1591,7 +1615,6 @@ export function BookingDetailsDialog({
                     color: "black",
                   }}
                 >
-
                   <div
                     style={{
                       display: "flex",
@@ -1663,7 +1686,6 @@ export function BookingDetailsDialog({
                     📊 STATEMENT OF ACCOUNT
                   </h1>
 
-
                   <div
                     style={{
                       display: "grid",
@@ -1694,7 +1716,6 @@ export function BookingDetailsDialog({
                       </p>
                     </div>
                   </div>
-
 
                   <div
                     style={{
@@ -1738,7 +1759,6 @@ export function BookingDetailsDialog({
                       </p>
                     </div>
                   </div>
-
 
                   <table
                     style={{
@@ -1814,7 +1834,6 @@ export function BookingDetailsDialog({
                     </tbody>
                   </table>
 
-
                   <div
                     style={{
                       borderTop: "2px solid black",
@@ -1862,7 +1881,6 @@ export function BookingDetailsDialog({
                       </span>
                     </div>
                   </div>
-
 
                   <p
                     style={{

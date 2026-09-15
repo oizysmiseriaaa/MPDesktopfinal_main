@@ -120,11 +120,15 @@ export default function PaymentsClient() {
     return balances;
   }, [securityDeposits]);
 
-  // The Security Deposit Ledger is a transaction log: every document from the
-  // security-deposits collection must appear as its own row (no month skipping).
+  // Keep the Security Deposits table on the same month-filtered transaction
+  // set used by the summary cards and Reports. Every document remains a row.
   const depositLedger = useMemo(
-    () => securityDeposits.map((d) => ({ ...d, _type: "deposit" as const })),
-    [securityDeposits],
+    () =>
+      filterSecurityDeposits(securityDeposits, { month, year }).map((d) => ({
+        ...d,
+        _type: "deposit" as const,
+      })),
+    [securityDeposits, month, year],
   );
 
   const mergedLedger = useMemo(() => {
@@ -184,15 +188,35 @@ export default function PaymentsClient() {
     const value = rawReference.toLowerCase();
     // Don't surface a raw Firestore/Auth ID as the "reference".
     if (looksLikeFirestoreId(rawReference)) {
-      return { label: "Unknown", icon: "", color: getBookingSourceColor("N/A") };
+      return {
+        label: "Unknown",
+        icon: "",
+        color: getBookingSourceColor("N/A"),
+      };
     }
     if (value.includes("airbnb"))
-      return { label: "Airbnb", icon: "/images/airbnb_logo.png", color: getBookingSourceColor("Airbnb") };
+      return {
+        label: "Airbnb",
+        icon: "/images/airbnb_logo.png",
+        color: getBookingSourceColor("Airbnb"),
+      };
     if (value.includes("booking"))
-      return { label: "Booking.com", icon: "/images/booking_logo.png", color: getBookingSourceColor("Booking.com") };
+      return {
+        label: "Booking.com",
+        icon: "/images/booking_logo.png",
+        color: getBookingSourceColor("Booking.com"),
+      };
     if (value.includes("facebook"))
-      return { label: "Facebook Page", icon: "/images/facebook_logo.png", color: getBookingSourceColor("Facebook Page") };
-    return { label: rawReference || "Unknown", icon: "", color: getBookingSourceColor(rawReference) };
+      return {
+        label: "Facebook Page",
+        icon: "/images/facebook_logo.png",
+        color: getBookingSourceColor("Facebook Page"),
+      };
+    return {
+      label: rawReference || "Unknown",
+      icon: "",
+      color: getBookingSourceColor(rawReference),
+    };
   };
 
   // Enrich each row with display helpers used by sorting + rendering.
@@ -853,7 +877,11 @@ export default function PaymentsClient() {
     if (row.source.icon) {
       return (
         <span className="inline-flex items-center gap-1.5">
-          <span aria-hidden="true" className="h-2 w-2 rounded-full" style={{ backgroundColor: row.source.color }} />
+          <span
+            aria-hidden="true"
+            className="h-2 w-2 rounded-full"
+            style={{ backgroundColor: row.source.color }}
+          />
           <img
             src={row.source.icon}
             alt={row.source.label}
@@ -865,7 +893,11 @@ export default function PaymentsClient() {
     }
     return (
       <span className="inline-flex items-center gap-1.5 text-xs font-medium">
-        <span aria-hidden="true" className="h-2 w-2 rounded-full" style={{ backgroundColor: row.source.color }} />
+        <span
+          aria-hidden="true"
+          className="h-2 w-2 rounded-full"
+          style={{ backgroundColor: row.source.color }}
+        />
         {row.method === "GCASH" ? (
           <span className="text-[10px] font-bold uppercase text-emerald-600">
             GCash

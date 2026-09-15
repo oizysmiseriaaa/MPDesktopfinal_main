@@ -48,14 +48,10 @@ import {
   parseLocalOnly,
   summarizeSecurityDeposits,
   filterSecurityDeposits,
-  normalizeBookingSecurityDepositRecords,
-  normalizeSecurityDepositsFromBookings,
-  summarizeNormalizedSecurityDeposits,
   looksLikeFirestoreId,
 } from "@/lib/utils-app";
 import { useDateStore } from "@/lib/date-store";
 import { getHistoricalSummaryForMonth } from "@/lib/historical-expense-summaries";
-import { getUnitBasePrice } from "@/lib/unit-pricing";
 import { Badge } from "@/components/ui/badge";
 import Link from "next/link";
 import {
@@ -89,6 +85,7 @@ export default function AnalyticsClient() {
     "agents",
     "investors",
     "booking-payments",
+    "security-deposits",
   ]);
   const loading = analyticsResources.loading;
   const data = useMemo(
@@ -99,6 +96,7 @@ export default function AnalyticsClient() {
       agents: analyticsResources.data["agents"] ?? [],
       investors: analyticsResources.data["investors"] ?? [],
       bookingPayments: analyticsResources.data["booking-payments"] ?? [],
+      securityDeposits: analyticsResources.data["security-deposits"] ?? [],
     }),
     [analyticsResources.data],
   );
@@ -157,22 +155,45 @@ export default function AnalyticsClient() {
     [data.agents],
   );
 
-  // Single normalized dataset from Bookings for the Security Deposit Monitoring tab.
+  // Keep every security-deposits document as its own transaction. Bookings are
+  // used only to fill display fields that may be absent from older ledger rows.
   const sdNormalizedDeposits = useMemo(
     () =>
-      normalizeSecurityDepositsFromBookings(data.bookings).map((entry: any) => {
+      data.securityDeposits.map((entry: any) => {
         const booking = data.bookings.find(
           (b: any) => String(b.id) === String(entry.bookingId),
         );
         const resolvedAgent = getAgentNameForBooking(booking);
+        const rawType = String(
+          entry.type || entry.transactionType || "receive",
+        ).toLowerCase();
+        const amount = Number(entry.amount ?? entry.depositAmount ?? 0) || 0;
         return {
           ...entry,
+          amount,
+          depositAmount: amount,
+          type: rawType,
+          transactionType: entry.transactionType || rawType,
+          depositDate:
+            entry.transactionDate ||
+            entry.depositDate ||
+            entry.paidAt ||
+            entry.date ||
+            entry.createdAt ||
+            "",
           agent:
             resolvedAgent ||
             (looksLikeFirestoreId(entry.agent) ? "" : entry.agent || ""),
+          guestName:
+            entry.guestName ||
+            (booking
+              ? `${booking.guestFirstName || ""} ${booking.guestLastName || ""}`.trim()
+              : "") ||
+            "—",
+          unitName: entry.unitName || booking?.unitName || entry.unitId || "—",
         };
       }),
-    [data.bookings, getAgentNameForBooking],
+    [data.bookings, data.securityDeposits, getAgentNameForBooking],
   );
 
   // Agent/Guest filter options.
@@ -222,11 +243,11 @@ export default function AnalyticsClient() {
   ]);
 
   const sdMetrics = useMemo(
-    () => summarizeNormalizedSecurityDeposits(sdFilteredDeposits),
+    () => summarizeSecurityDeposits(sdFilteredDeposits),
     [sdFilteredDeposits],
   );
 
-  // One record per booking (not per money movement).
+  // One row per security-deposit money movement, matching Payments.
   const securityLedger = useMemo(() => {
     return [...sdFilteredDeposits].sort((a, b) => {
       const dateA = a.depositDate || a.checkinDate || "";
@@ -351,13 +372,24 @@ export default function AnalyticsClient() {
   }, [overviewMetrics]);
 
   const securityDepositSummary = useMemo(() => {
-    const summary = summarizeNormalizedSecurityDeposits(sdFilteredDeposits);
+    const summary = summarizeSecurityDeposits(sdFilteredDeposits);
     return {
-      collected: summary.totalCollected,
-      refunded: summary.totalRefunded,
+      collected: summary.collected,
+      refunded: summary.refunded,
       activeHeld: summary.activeHeld,
       outstanding: summary.activeHeld,
-      unpaid: summary.unpaidDeposits,
+      unpaid: sdFilteredDeposits
+        .filter(
+          (record: any) =>
+            String(
+              record.status || record.depositStatus || "",
+            ).toLowerCase() === "unpaid",
+        )
+        .reduce(
+          (total: number, record: any) =>
+            total + (Number(record.amount ?? record.depositAmount) || 0),
+          0,
+        ),
     };
   }, [sdFilteredDeposits]);
 
@@ -537,32 +569,26 @@ export default function AnalyticsClient() {
           );
 
           agentBookings.forEach((b) => {
-            const bRevenue = calculateProratedRevenue(b, month, year);
-            const bGrossIncome = calculateProratedBaseRevenue(b, month, year);
-            revenue += bRevenue;
-            grossIncome += bGrossIncome;
-
-            const unit = data.units.find(
-              (u) => String(u.id) === String(b.unitId),
-            );
-            if (unit) {
-              const checkin = new Date(b.checkinDate);
-              const checkout = new Date(b.checkoutDate);
-              const nights = Math.max(
-                1,
-                Math.round(
-                  (checkout.getTime() - checkin.getTime()) /
-                    (1000 * 60 * 60 * 24),
-                ),
-              );
-              const baseCost = nights * getUnitBasePrice(unit);
-              const surplus = Math.max(
-                0,
-                Number(b.totalAmount || 0) - baseCost,
-              );
-              commission += surplus * (bRevenue / Number(b.totalAmount || 1));
-            }
+            revenue += calculateProratedRevenue(b, month, year);
+            grossIncome += calculateProratedBaseRevenue(b, month, year);
           });
+          commission = data.expenses
+            .filter(
+              (expenseRecord) =>
+                expenseRecord.category === "Agent Commission" &&
+                String(expenseRecord.agentId) === selectedEntity &&
+                expenseRecord.date?.startsWith(monthKey) &&
+                expenseRecord.commissionStatus !== "cancelled" &&
+                expenseRecord.status !== "Cancelled",
+            )
+            .reduce(
+              (sum, expenseRecord) =>
+                sum +
+                Number(
+                  expenseRecord.calculatedTotal || expenseRecord.amount || 0,
+                ),
+              0,
+            );
         }
       } else if (reportType === "investor") {
         const investor = data.investors.find(
@@ -1146,14 +1172,14 @@ export default function AnalyticsClient() {
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6">
             <SDSummaryCard
               title="Total Collected"
-              value={formatCurrency(sdMetrics.totalCollected)}
+              value={formatCurrency(sdMetrics.collected)}
               icon={<ShieldCheck className="text-blue-600" />}
               bgColor="bg-blue-50 dark:bg-blue-950/30"
               textColor="text-blue-600"
             />
             <SDSummaryCard
               title="Total Refunded"
-              value={formatCurrency(sdMetrics.totalRefunded)}
+              value={formatCurrency(sdMetrics.refunded)}
               icon={<RotateCcw className="text-amber-600" />}
               bgColor="bg-amber-50 dark:bg-amber-950/30"
               textColor="text-amber-600"
@@ -1167,7 +1193,7 @@ export default function AnalyticsClient() {
             />
             <SDSummaryCard
               title="Unpaid Deposits"
-              value={formatCurrency(sdMetrics.unpaidDeposits)}
+              value={formatCurrency(securityDepositSummary.unpaid)}
               icon={<Calculator className="text-slate-600" />}
               bgColor="bg-slate-50 dark:bg-slate-950/30"
               textColor="text-slate-600"
@@ -1453,8 +1479,8 @@ export default function AnalyticsClient() {
                 Security Deposit Ledger
               </CardTitle>
               <p className="text-sm text-muted-foreground">
-                One row per booking. Deposit amounts, status, and assigned agent
-                come directly from Bookings, the single source of truth.
+                Every received and refunded transaction for the selected month.
+                Details are read from the security-deposits ledger.
               </p>
             </CardHeader>
             <CardContent>
@@ -1467,11 +1493,13 @@ export default function AnalyticsClient() {
                   <table className="w-full text-sm">
                     <thead>
                       <tr className="border-b border-border text-left text-muted-foreground">
+                        <th className="py-2 pr-3">Transaction Type</th>
+                        <th className="py-2 pr-3">Date</th>
                         <th className="py-2 pr-3">Guest</th>
                         <th className="py-2 pr-3">Unit</th>
-                        <th className="py-2 pr-3 text-right">Deposit Amount</th>
+                        <th className="py-2 pr-3">Payment Method</th>
                         <th className="py-2 pr-3">Status</th>
-                        <th className="py-2">Assigned Agent</th>
+                        <th className="py-2 pr-3 text-right">Deposit Amount</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1480,33 +1508,78 @@ export default function AnalyticsClient() {
                           key={entry.id || entry.bookingId || index}
                           className="border-b border-border/60"
                         >
-                          <td className="py-2 pr-3">
-                            {entry.guestName || "—"}
-                          </td>
-                          <td className="py-2 pr-3">
-                            {entry.unitName || entry.unitId || "—"}
-                          </td>
-                          <td className="py-2 pr-3 text-right">
-                            {formatCurrency(Number(entry.depositAmount) || 0)}
-                          </td>
-                          <td className="py-2 pr-3">
-                            <Badge
-                              className={`rounded-full ${
-                                entry.status === "Paid"
-                                  ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
-                                  : entry.status === "Partial"
-                                    ? "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
-                                    : "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300"
-                              }`}
-                            >
-                              {entry.status || "—"}
-                            </Badge>
-                          </td>
-                          <td className="py-2">
-                            {looksLikeFirestoreId(entry.agent)
-                              ? "—"
-                              : entry.agent || "—"}
-                          </td>
+                          {(() => {
+                            const isRefund =
+                              String(entry.type || entry.transactionType || "")
+                                .toLowerCase()
+                                .includes("refund") ||
+                              String(entry.status || "").toLowerCase() ===
+                                "refunded";
+                            const dateValue =
+                              entry.depositDate ||
+                              entry.paidAt ||
+                              entry.date ||
+                              entry.createdAt ||
+                              "";
+                            const dateLabel = dateValue
+                              ? new Date(dateValue).toLocaleDateString(
+                                  undefined,
+                                  {
+                                    year: "numeric",
+                                    month: "long",
+                                    day: "numeric",
+                                  },
+                                )
+                              : "—";
+                            const status = isRefund
+                              ? "Refunded"
+                              : entry.status || "Paid";
+                            return (
+                              <>
+                                <td className="py-2 pr-3">
+                                  {isRefund ? "Refunded" : "Received"}
+                                </td>
+                                <td className="py-2 pr-3">{dateLabel}</td>
+                                <td className="py-2 pr-3">
+                                  {entry.guestName || "—"}
+                                </td>
+                                <td className="py-2 pr-3">
+                                  {entry.unitName || entry.unitId || "—"}
+                                </td>
+                                <td className="py-2 pr-3">
+                                  {entry.method ||
+                                    entry.paymentMethod ||
+                                    "Cash"}
+                                </td>
+                                <td className="py-2 pr-3">
+                                  <Badge
+                                    className={`rounded-full ${
+                                      isRefund
+                                        ? "bg-rose-100 text-rose-700"
+                                        : status === "Partial"
+                                          ? "bg-amber-100 text-amber-700"
+                                          : "bg-emerald-100 text-emerald-700"
+                                    }`}
+                                  >
+                                    {status}
+                                  </Badge>
+                                </td>
+                                <td className="py-2 pr-3 text-right">
+                                  {formatCurrency(
+                                    isRefund
+                                      ? -Math.abs(
+                                          Number(
+                                            entry.amount ?? entry.depositAmount,
+                                          ) || 0,
+                                        )
+                                      : Number(
+                                          entry.amount ?? entry.depositAmount,
+                                        ) || 0,
+                                  )}
+                                </td>
+                              </>
+                            );
+                          })()}
                         </tr>
                       ))}
                     </tbody>

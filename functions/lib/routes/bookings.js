@@ -138,8 +138,8 @@ exports.bookingsRouter.post(
         if (agentSnap.exists) {
           agentCommission = (0, route_helpers_1.computeAgentCommission)(
             agentSnap.data(),
-            baseRate,
-            totalAmount,
+            newBooking,
+            unitData,
           );
         }
       }
@@ -249,6 +249,29 @@ exports.bookingsRouter.post(
           },
         }),
       ]);
+      let commissionError = null;
+      try {
+        let agent = null;
+        if (newBooking.agentId) {
+          const agentSnap = await adminDb
+            .collection("agents")
+            .doc(String(newBooking.agentId))
+            .get();
+          agent = agentSnap.exists ? agentSnap.data() : null;
+        }
+        await (0, route_helpers_1.syncAgentCommission)(
+          id,
+          bookingWithId,
+          unitData,
+          { agent },
+        );
+      } catch (err) {
+        commissionError = err?.message || "Commission synchronization failed";
+        console.error("Agent commission synchronization failed", {
+          bookingId: id,
+          error: err,
+        });
+      }
       await Promise.all([
         (0, route_helpers_1.recomputeBookingPayment)(id),
         (0, route_helpers_1.recomputeSecurityDeposit)(id),
@@ -281,7 +304,9 @@ exports.bookingsRouter.post(
           data: { bookingId: id, unitId: newBooking.unitId },
         });
       }
-      return res.status(201).json({ bookingId: id, id, totalAmount });
+      return res
+        .status(201)
+        .json({ bookingId: id, id, totalAmount, commissionError });
     } catch (err) {
       if (err?.code === "booking-conflict") {
         return res.status(409).json({
@@ -429,24 +454,22 @@ exports.bookingsRouter.put(
             .doc(effectiveAgentId)
             .get();
           if (agentSnap.exists) {
-            const effectiveTotalAmount = (0, route_helpers_1.toNumber)(
-              updatedFields.totalAmount ?? before?.totalAmount,
-            );
             agentCommission = (0, route_helpers_1.computeAgentCommission)(
               agentSnap.data(),
-              computedBaseRate,
-              effectiveTotalAmount,
+              {
+                ...before,
+                ...bookingData,
+                checkinDate: bookingData.checkinDate || before.checkinDate,
+                checkoutDate: bookingData.checkoutDate || before.checkoutDate,
+                adults: bookingData.adults ?? before.adults,
+                children: bookingData.children ?? before.children,
+              },
+              unit,
             );
           }
         }
         updatedFields.agentCommission = agentCommission;
       } else if (bookingData.agentId !== undefined) {
-        const existingBaseRate = (0, route_helpers_1.toNumber)(
-          before?.baseRate ?? before?.totalAmount,
-        );
-        const existingTotalAmount = (0, route_helpers_1.toNumber)(
-          before?.totalAmount,
-        );
         let agentCommission = 0;
         if (bookingData.agentId) {
           const agentSnap = await adminDb
@@ -456,8 +479,11 @@ exports.bookingsRouter.put(
           if (agentSnap.exists) {
             agentCommission = (0, route_helpers_1.computeAgentCommission)(
               agentSnap.data(),
-              existingBaseRate,
-              existingTotalAmount,
+              {
+                ...before,
+                ...bookingData,
+              },
+              effectiveUnitSnap.data(),
             );
           }
         }
@@ -496,6 +522,29 @@ exports.bookingsRouter.put(
         (0, route_helpers_1.toNumber)(refreshed.totalAmount) -
           refreshedCommission,
       );
+      let commissionError = null;
+      try {
+        let agent = null;
+        if (refreshed.agentId) {
+          const agentSnap = await adminDb
+            .collection("agents")
+            .doc(String(refreshed.agentId))
+            .get();
+          agent = agentSnap.exists ? agentSnap.data() : null;
+        }
+        await (0, route_helpers_1.syncAgentCommission)(
+          req.params.bookingId,
+          refreshed,
+          unitDoc.data(),
+          { agent },
+        );
+      } catch (err) {
+        commissionError = err?.message || "Commission synchronization failed";
+        console.error("Agent commission synchronization failed", {
+          bookingId: req.params.bookingId,
+          error: err,
+        });
+      }
       let resolvedPaymentAmount = 0;
       if (paymentStatus === "Paid") {
         resolvedPaymentAmount =
@@ -591,7 +640,10 @@ ${changedFields}
 ​`,
         });
       }
-      return res.status(200).json({ message: "Booking updated successfully" });
+      return res.status(200).json({
+        message: "Booking updated successfully",
+        commissionError,
+      });
     } catch (err) {
       if (err?.code === "booking-conflict") {
         return res.status(409).json({

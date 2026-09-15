@@ -27,6 +27,12 @@ describe("Tauri desktop export permissions", () => {
     expect(capabilityConfig).toContain(
       '"path": "$DESKTOP/ManilaPrime/Quotations/*"',
     );
+    expect(capabilityConfig).toContain(
+      '"path": "$DESKTOP/ManilaPrime/GuestAuthorization"',
+    );
+    expect(capabilityConfig).toContain(
+      '"path": "$DESKTOP/ManilaPrime/GuestAuthorization/*"',
+    );
     expect(capabilityConfig).toContain('"path": "$DESKTOP/ManilaPrime/SOA"');
     expect(capabilityConfig).toContain('"path": "$DESKTOP/ManilaPrime/SOA/*"');
     expect(capabilityConfig).toContain('"fs:allow-exists"');

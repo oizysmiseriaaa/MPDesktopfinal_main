@@ -341,13 +341,11 @@ exports.propertiesRouter.post("/expense", async (req, res) => {
       });
     }
     const totals = (0, route_helpers_1.computeExpenseTotals)(normalized);
-    const docData = (0, route_helpers_1.buildExpenseFirestoreDocument)(
-      normalized,
-      totals,
-      {
+    const docData = (0, route_helpers_1.stripUndefinedFields)(
+      (0, route_helpers_1.buildExpenseFirestoreDocument)(normalized, totals, {
         createdAt: requestBody.createdAt || new Date().toISOString(),
         ...(requestBody.updatedAt ? { updatedAt: requestBody.updatedAt } : {}),
-      },
+      }),
     );
     // Use deterministic ID if provided (for idempotency), otherwise auto-generate
     if (requestBody.id) {
@@ -390,12 +388,10 @@ exports.propertiesRouter.put("/expense/:expenseId", async (req, res) => {
       });
     }
     const totals = (0, route_helpers_1.computeExpenseTotals)(normalized);
-    const docData = (0, route_helpers_1.buildExpenseFirestoreDocument)(
-      normalized,
-      totals,
-      {
+    const docData = (0, route_helpers_1.stripUndefinedFields)(
+      (0, route_helpers_1.buildExpenseFirestoreDocument)(normalized, totals, {
         updatedAt: requestBody.updatedAt || new Date().toISOString(),
-      },
+      }),
     );
     await ref.update(docData);
     return res.status(200).json({ message: "Expense updated successfully" });
